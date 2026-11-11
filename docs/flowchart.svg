@@ -87,7 +87,7 @@
   <path class="line" d="M740 240V288"/>
   <text class="yn" x="762" y="268">Yes</text>
   <rect class="bad" x="580" y="290" width="320" height="88" rx="8"/>
-  <text class="b" x="740" y="317">The user's largest process is killed</text>
+  <text class="b" x="740" y="317">All the user's processes are killed</text>
   <text x="740" y="338">Page swap disabled. Other users unaffected.</text>
   <text x="740" y="358">The user is notified by email.</text>
 
@@ -105,9 +105,10 @@
 
   <path class="line" d="M740 530V578"/>
   <text class="yn" x="762" y="558">Yes</text>
-  <rect class="bad" x="590" y="580" width="300" height="68" rx="8"/>
-  <text class="b" x="740" y="608">The largest user process is killed</text>
-  <text x="740" y="629">The admin is notified by email.</text>
+  <rect class="bad" x="590" y="580" width="300" height="84" rx="8"/>
+  <text class="b" x="740" y="608">The user with the largest process</text>
+  <text class="b" x="740" y="627">has all their processes killed</text>
+  <text x="740" y="648">The admin is notified by email.</text>
 
   <!-- notes -->
   <rect class="note" x="590" y="700" width="430" height="120" rx="8"/>

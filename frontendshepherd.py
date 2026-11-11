@@ -23,6 +23,7 @@ Python 3.6+, standard library only. Needs cgroup v2 and systemd.
 
 import argparse
 import configparser
+import errno
 import glob
 import json
 import logging
@@ -64,14 +65,16 @@ running. Run `frontendshepherd status` on the login node to follow it.
 Your busiest processes right now:
 
 {processes}""",
-    "oom_subject": "[{cluster}] A process of yours on {host} was killed (out of memory)",
+    "oom_subject": "[{cluster}] Your processes on {host} were killed (out of memory)",
     "oom_body": """\
 Hi {user},
 
-One or more of your processes on the login node {host} were killed
-because they ran out of memory. Each user may use at most {user_max_gb} GB on
-a login node (files in /dev/shm count too), and all users together share
-what the node has.
+All your processes on the login node {host} were killed, and you were
+logged out, because together they used more memory than allowed. The
+largest process was `{process}`.
+
+Each user may use at most {user_max_gb} GB on a login node (files in
+/dev/shm count too), and all users together share what the node has.
 
 Work that needs this much memory belongs in a batch job on the compute
 nodes.""",
@@ -125,6 +128,9 @@ DEFAULTS = {
 }
 
 log = logging.getLogger("frontendshepherd")
+
+# The kernel's log line for an out-of-memory kill in a cgroup
+OOM_RE = re.compile(r"oom-kill:.*oom_memcg=(/[^,]*),.*task=([^,]*),pid=")
 
 
 # --------------------------------------------------------------------------
@@ -250,7 +256,8 @@ class Shepherd:
         self.reaper_interval = r.getfloat("interval_minutes") * 60
         self.reaper_last = 0.0
 
-        self.state = {"users": {}, "total_oom": 0, "admin_mailed": 0}
+        self.state = {"users": {}, "admin_mailed": 0}
+        self.kmsg = None  # kernel log, opened in run()
         self.stop = threading.Event()
 
     # ---- state ----------------------------------------------------------
@@ -276,7 +283,7 @@ class Shepherd:
 
     def new_user(self, now):
         return {"level": self.capacity, "throttled": False, "usage": None,
-                "ts": now, "cores": 0.0, "events": [], "mailed": {}, "oom": 0}
+                "ts": now, "cores": 0.0, "events": [], "mailed": {}}
 
     def exempt(self, uid):
         return uid < self.min_uid or username(uid) in self.exempt_users
@@ -377,7 +384,7 @@ class Shepherd:
                     smtp.login(self.smtp_user, f.read().strip())
             smtp.send_message(msg)
 
-    def notify_user(self, uid, kind, st, now):
+    def notify_user(self, uid, kind, st, now, process=""):
         if now - st["mailed"].get(kind, 0) < self.cooldown:
             return
         st["mailed"][kind] = now
@@ -391,7 +398,9 @@ class Shepherd:
             "refill_hours": "%.3g" % self.refill_hours,
             "user_max_gb": "%.3g" % self.user_max_gb,
             "events": len(st["events"]), "days": "%.3g" % (self.repeat_window / 86400),
-            "processes": top_processes(uid) if kind == "throttle" else "",
+            "processes": (top_processes(os.path.join(self.user_slice, "user-%s.slice" % uid))
+                          if kind == "throttle" else ""),
+            "process": process,
         }
         body = self.render(kind + "_body", values) + "\n"
         if repeat:
@@ -443,7 +452,7 @@ class Shepherd:
 
             if usage is None:  # no slice: user has nothing running here
                 used = 0.0
-                st["usage"], st["oom"] = 0.0, 0
+                st["usage"] = 0.0
             else:
                 prev = st["usage"]
                 if prev is None:          # first time we see this user
@@ -470,34 +479,83 @@ class Shepherd:
             if usage is not None:
                 self.ensure_quota(uid, path,
                                   self.min_cpus if st["throttled"] else self.burst)
-                ooms = read_kv(os.path.join(path, "memory.events")).get("oom_kill", 0)
-                if ooms > st["oom"]:
-                    st["events"].append(now)
-                    log.info("OOM %s (uid %s): %d process(es) killed", name, uid, ooms - st["oom"])
-                    self.notify_user(uid, "oom", st, now)
-                st["oom"] = ooms
+                self.ensure_group_kill(path)
             elif st["level"] >= self.capacity and not st["events"]:
                 del users[uid]  # logged out, bucket full, clean record: forget
 
-        self.check_total_oom(now)
+        self.check_oom(now)
         if self.reaper_enabled and now - self.reaper_last >= self.reaper_interval:
             self.reaper_last = now
             self.reap(now)
         self.save_state()
 
-    def check_total_oom(self, now):
-        """Tell the admin when the limit for all users together was hit."""
-        n = read_kv(os.path.join(self.user_slice, "memory.events.local")).get("oom", 0)
-        if n > self.state["total_oom"]:
-            log.warning("user.slice hit the total memory limit for all users")
-            if now - self.state["admin_mailed"] >= self.cooldown:
-                self.state["admin_mailed"] = now
-                self.send(self.admin,
-                          "[%s] %s: total user memory limit reached" % (self.cluster, self.host),
-                          "All users together hit the memory limit of user.slice on %s and the\n"
-                          "kernel killed the largest process(es). See `journalctl -k` for which,\n"
-                          "and `frontendshepherd status` for current usage.\n" % self.host)
-        self.state["total_oom"] = n
+    def ensure_group_kill(self, path):
+        """Set memory.oom.group on a user's slice: when the user runs out of
+        memory the kernel then kills all of that user's processes at once.
+        Without it the kernel kills one process, and while that memory is
+        being freed it may go on to kill arbitrary other ones of the user."""
+        f = os.path.join(path, "memory.oom.group")
+        if self.dry_run or (read_file(f) or "").strip() != "0":
+            return
+        try:
+            with open(f, "w") as fh:
+                fh.write("1")
+        except OSError as e:
+            log.warning("cannot set %s: %s", f, e)
+
+    def open_kmsg(self):
+        try:
+            self.kmsg = os.open("/dev/kmsg", os.O_RDONLY | os.O_NONBLOCK)
+            os.lseek(self.kmsg, 0, os.SEEK_END)  # only what happens from now on
+        except OSError as e:
+            log.warning("cannot read the kernel log (%s): out-of-memory kills "
+                        "will not be logged or mailed", e)
+
+    def oom_events(self):
+        """Out-of-memory kills the kernel has logged since the last call, as
+        (cgroup that hit its limit, name of the process chosen) pairs. The
+        kernel log is used because it still names the user after all their
+        processes, and with them their cgroup, are gone."""
+        out = []
+        while self.kmsg is not None:
+            try:
+                record = os.read(self.kmsg, 8192).decode("utf-8", "replace")
+            except BlockingIOError:
+                break  # nothing new
+            except OSError as e:
+                if e.errno == errno.EPIPE:
+                    continue  # older records were overwritten; carry on
+                break
+            m = OOM_RE.search(record)
+            if m:
+                out.append((m.group(1), m.group(2)))
+        return out
+
+    def check_oom(self, now):
+        seen = {}
+        for memcg, process in self.oom_events():
+            seen.setdefault(memcg, process)  # one report per cgroup and check
+        for memcg, process in seen.items():
+            m = re.match(r"/user\.slice/user-(\d+)\.slice$", memcg)
+            if m and not self.exempt(int(m.group(1))):
+                uid = m.group(1)
+                st = self.state["users"].setdefault(uid, self.new_user(now))
+                st["events"].append(now)
+                log.info("OOM %s (uid %s): over the memory limit, processes killed "
+                         "(largest: %s)", username(uid), uid, process)
+                self.notify_user(uid, "oom", st, now, process)
+            elif memcg == "/user.slice":
+                log.warning("OOM all users together hit the total memory limit; the "
+                            "user with the largest process (%s) was killed", process)
+                if now - self.state["admin_mailed"] >= self.cooldown:
+                    self.state["admin_mailed"] = now
+                    self.send(self.admin,
+                              "[%s] %s: total user memory limit reached" % (self.cluster, self.host),
+                              "All users together hit the memory limit of user.slice on %s.\n"
+                              "The kernel killed all processes of the user with the largest\n"
+                              "process (%s). See `journalctl -k` for details and\n"
+                              "`frontendshepherd status --all` for current usage.\n"
+                              % (self.host, process))
 
     def reap(self, now):
         """SIGTERM old processes whose command line matches a reaper pattern."""
@@ -506,11 +564,16 @@ class Shepherd:
         if boot is None:
             return
         hz = os.sysconf("SC_CLK_TCK")
-        for d in glob.glob("/proc/[0-9]*"):
+        # Only processes in the users' login slices: a user's batch jobs run
+        # elsewhere (for example under slurmstepd) and are left alone.
+        candidates = []
+        for path in glob.glob(os.path.join(self.user_slice, "user-*.slice")):
+            m = re.search(r"user-(\d+)\.slice$", path)
+            if m and not self.exempt(int(m.group(1))):
+                candidates += [(int(m.group(1)), pid) for pid in slice_pids(path)]
+        for uid, pid in candidates:
+            d = "/proc/%d" % pid
             try:
-                uid = os.stat(d).st_uid
-                if self.exempt(uid):
-                    continue
                 cmd = (read_file(d + "/cmdline") or "").replace("\0", " ").strip()
                 if not cmd or not any(p.search(cmd) for p in self.reaper_patterns):
                     continue
@@ -519,7 +582,6 @@ class Shepherd:
                 age = now - (boot + start / hz)
                 if age < self.reaper_max_age:
                     continue
-                pid = int(os.path.basename(d))
                 log.info("REAP pid %d of %s, %.0f days old: %s%s", pid, username(uid),
                          age / 86400, cmd[:120], " [dry run]" if self.dry_run else "")
                 if not self.dry_run:
@@ -541,6 +603,7 @@ class Shepherd:
             log.info("DRY RUN: nothing is limited, no mail is sent, only logging")
         else:
             self.write_dropins()
+        self.open_kmsg()
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: self.stop.set())
         log.info("started: %s", self.policy())
@@ -568,10 +631,24 @@ def meminfo_total_kb():
     return 0
 
 
-def top_processes(uid, n=8):
+def slice_pids(path):
+    """All process ids in a cgroup and the cgroups below it."""
+    pids = []
+    for root, _dirs, files in os.walk(path):
+        if "cgroup.procs" in files:
+            pids += [int(p) for p in (read_file(os.path.join(root, "cgroup.procs")) or "").split()]
+    return pids
+
+
+def top_processes(slice_path, n=8):
+    """The busiest processes in a user's login slice (not their batch jobs)."""
+    pids = slice_pids(slice_path)
+    if not pids:
+        return "  (none)"
     try:
         out = subprocess.run(
-            ["ps", "-u", str(uid), "-o", "pid,pcpu,pmem,etime,args", "--sort=-pcpu"],
+            ["ps", "-p", ",".join(map(str, pids)), "-o", "pid,pcpu,pmem,etime,args",
+             "--sort=-pcpu"],
             stdout=subprocess.PIPE, universal_newlines=True, timeout=10).stdout
         return "\n".join("  " + l[:110] for l in out.splitlines()[:n + 1])
     except (OSError, subprocess.SubprocessError):

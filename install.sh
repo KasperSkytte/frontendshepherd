@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 install -m 755 frontendshepherd.py /usr/local/bin/frontendshepherd
 install -m 644 frontendshepherd.service /etc/systemd/system/frontendshepherd.service
 if [ -e /etc/frontendshepherd.conf ]; then
-    echo "keeping existing /etc/frontendshepherd.conf"
+    echo "Keeping the existing config file /etc/frontendshepherd.conf"
 else
     install -m 644 frontendshepherd.conf /etc/frontendshepherd.conf
 fi
@@ -16,7 +16,11 @@ fi
 systemctl daemon-reload
 systemctl enable frontendshepherd
 systemctl restart frontendshepherd
-echo "Installed. Follow it with: journalctl -fu frontendshepherd"
-grep -q '^dry_run *= *true' /etc/frontendshepherd.conf &&
-    echo "It is in DRY RUN mode: set dry_run = false in /etc/frontendshepherd.conf to enforce."
+echo "frontendshepherd is installed and running."
+echo "View its log with: journalctl -fu frontendshepherd"
+grep -q '^dry_run *= *true' /etc/frontendshepherd.conf && {
+    echo "frontendshepherd is in DRY RUN mode: it only logs and limits nothing."
+    echo "To enforce the limits, set dry_run = false in /etc/frontendshepherd.conf"
+    echo "and run: systemctl restart frontendshepherd"
+}
 exit 0

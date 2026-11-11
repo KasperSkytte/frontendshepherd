@@ -2,11 +2,11 @@
 
 `frontendshepherd` is a tool to automatically limit the resources (CPU and memory) available to each user on the shared frontend (aka access/login) nodes of a computing cluster to keep them responsive. It prevents situations where one or a few users block access for everyone else by running large computing jobs directly on a frontend node, accidentally or deliberately, instead of submitting them as batch jobs to the dedicated compute nodes. Such jobs can use all CPU cores or, even worse, crash the node due to memory starvation. Users who exceed the limits are restricted automatically and receive an email explaining why.
 
-**Memory usage** is hard-limited per user (by default 16GB), where the user's largest process is killed if the limit is exceeded. The total amount of memory available to all users together is also limited (by default 8GB is always kept for the host), so the node itself can never run out. (in the future `/tmp` will also be managed)
+**Memory usage** is hard-limited per user (by default 16GB), where all of the user's processes on the node are killed if the limit is exceeded. The total amount of memory available to all users together is also limited (by default 8GB is always kept for the host), so the node itself can never run out. (in the future `/tmp` will also be managed)
 
-**CPU usage** is limited both with a max number of available CPUs per user, but also a "bucket" of CPU hours per user (by default 8 CPU hours), so that some burst load is always possible, for example for compiling and installing software, building containers, brief data analysis etc. When the bucket is empty, the user's processes are throttled to a bare minimum (by default 2 CPUs), which is still enough for longer `rsync` data transfers and for normal work like coding on the frontend node. The throttle is lifted when the bucket has refilled completely (by default after 4 hours), and it only refills while the user's average CPU usage is below the bare minimum.
+**CPU usage** is limited both with a max number of available CPUs per user, but also by using a "bucket" of CPU hours per user (by default 8 CPU hours), so that some burst load is always possible, for example for compiling and installing software, building containers, doing quick data analyses etc. When the bucket is empty, the user's processes are throttled to a bare minimum (by default 2 CPUs), which is still enough for longer `rsync` data transfers and for normal work like coding on the frontend node. The throttle is lifted when the bucket has refilled completely (by default after 4 hours), and it only refills while the user's average CPU usage is below the bare minimum.
 
-**Stale processes** matching a pattern (like `vscode-server` processes!) are automatically killed after a defined time (by default 7 days) to prevent unnecessary processes from accumulating over time.
+**Stale processes** matching a pattern (like `vscode-server` processes!) are automatically killed after running for a max walltime (by default 7 days) to prevent unnecessary processes from accumulating over time.
 
 `frontendshepherd` only restricts users. No resources are reserved for individual users, they are only limited, so all users still share the whole node and any number of users can be logged in at once. 
 
@@ -33,7 +33,7 @@ Note: A CPU is one hardware thread, as counted by `nproc` and `top`. For example
 ### Memory
 | Setting | Default | |
 |---|---|---|
-| `user_max_gb` | `16` | Memory per user. Hard limit. Exceeding this limit kills that user's largest process. No page swap is ever allowed to prevent local storage filling up. |
+| `user_max_gb` | `16` | Memory per user. Hard limit. Exceeding this limit kills all of that user's processes on the node, and other users are not affected. No page swap is ever allowed to prevent local storage filling up. |
 | `reserved_gb` | `8` | Memory always unavailable to users to avoid exhausting the node. |
 
 ### Stale or long-running processes
@@ -98,7 +98,7 @@ Every login already runs in its own systemd cgroup, `user-UID.slice`. At startup
 
 The CPU counter is the kernel's running total of CPU time used by all of the user's processes together. The difference between two readings, divided by the 10 seconds, is the user's average number of CPUs in that interval, so short spikes and dips are averaged out. Above the bare minimum all of the usage is taken from the bucket (not only the part above the bare minimum), below it the bucket refills, and right at it (within 5 %) nothing happens. The throttle goes on only when the bucket is completely empty and off only when it is completely full, so it can never flip back and forth quickly.
 
-Users get an email when they are throttled or when a process is killed for memory, at most one of each per day. Admins are not mailed about individual users, only when the total memory limit of the node is reached. I/O is never limited and nothing is ever killed for using CPU. Root and system accounts are exempt.
+Users get an email when they are throttled or when their processes are killed for exceeding the memory limit, at most one of each per day. Admins are not mailed about individual users, only when the total memory limit of the node is reached. I/O is never limited and nothing is ever killed for using CPU. Root and system accounts are exempt.
 
 There is no limit on the number of users logged in at once. Nothing is reserved per user, the limits are only ceilings, so the sum of all users' limits can be much larger than the node. The total memory limit for all users is what protects the node when many users are busy at the same time.
 

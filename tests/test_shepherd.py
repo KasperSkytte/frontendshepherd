@@ -31,20 +31,18 @@ class Fake:
         self.s.send = lambda to, subject, body, cc=None: self.mails.append((to, subject, cc))
         self.now = 1_000_000.0
         self.cpu = 0.0
-        self.set(0)
+        self.set()
 
-    def set(self, ooms):
+    def set(self):
         with open(os.path.join(self.slice, "cpu.stat"), "w") as f:
             f.write("usage_usec %d\nuser_usec 0\n" % (self.cpu * 1e6))
-        with open(os.path.join(self.slice, "memory.events"), "w") as f:
-            f.write("low 0\noom_kill %d\n" % ooms)
 
-    def run(self, cores, seconds, ooms=0, step=10):
+    def run(self, cores, seconds, step=10):
         """Advance time with the user burning `cores` cores."""
         for _ in range(int(seconds / step)):
             self.now += step
             self.cpu += cores * step
-            self.set(ooms)
+            self.set()
             self.s.tick(self.now)
         return self.s.state["users"].get(UID)
 
@@ -113,7 +111,7 @@ class TestBucket(unittest.TestCase):
         # log in again: the fresh slice already burned 100 core-seconds
         os.rename(f.slice + ".gone", f.slice)
         f.cpu = 100.0
-        f.set(0)
+        f.set()
         f.now += 10
         f.s.tick(f.now)
         self.assertAlmostEqual(st["level"], level + 60 * f.s.refill - 100)
@@ -125,12 +123,18 @@ class TestBucket(unittest.TestCase):
         f.s.tick(f.now + 10)
         self.assertEqual(f.s.state["users"], {})
 
+    def oom(self, f, memcg=None, process="python3"):
+        """Let the next check see one kernel OOM kill."""
+        f.s.oom_events = lambda: [(memcg or "/user.slice/user-%s.slice" % UID, process)]
+        f.run(cores=0, seconds=10)
+        f.s.oom_events = lambda: []
+
     def test_admin_is_not_copied_by_default(self):
         f = Fake()
         f.s.cooldown = 0
         f.s.tick(f.now)
-        for n in range(1, 6):
-            f.run(cores=0, seconds=10, ooms=n)
+        for _ in range(5):
+            self.oom(f)
         self.assertEqual([m[2] for m in f.mails], [None] * 5)
 
     def test_oom_mail_and_repeat_offender_cc(self):
@@ -138,19 +142,42 @@ class TestBucket(unittest.TestCase):
         f.s.cooldown = 0
         f.s.repeat_events = 3
         f.s.tick(f.now)
-        f.run(cores=0, seconds=10, ooms=1)
-        f.run(cores=0, seconds=10, ooms=2)
+        self.oom(f)
+        self.oom(f)
         self.assertEqual([m[2] for m in f.mails], [None, None])
-        f.run(cores=0, seconds=10, ooms=3)
+        self.oom(f)
         self.assertEqual(f.mails[-1][2], f.s.admin)
         self.assertIn("out of memory", f.mails[-1][1])
 
     def test_mail_cooldown(self):
         f = Fake()
         f.s.tick(f.now)
-        f.run(cores=0, seconds=10, ooms=1)
-        f.run(cores=0, seconds=10, ooms=2)
+        self.oom(f)
+        self.oom(f)
         self.assertEqual(len(f.mails), 1)
+
+    def test_oom_is_reported_after_the_users_slice_is_gone(self):
+        f = Fake()
+        f.s.tick(f.now)
+        os.rename(f.slice, f.slice + ".gone")   # everything of the user was killed
+        f.s.oom_events = lambda: [("/user.slice/user-%s.slice" % UID, "python3")]
+        f.s.tick(f.now + 10)
+        self.assertEqual(len(f.mails), 1)
+        self.assertEqual(len(f.s.state["users"][UID]["events"]), 1)
+
+    def test_total_limit_mails_the_admin_only(self):
+        f = Fake()
+        f.s.tick(f.now)
+        self.oom(f, memcg="/user.slice")
+        self.assertEqual([m[0] for m in f.mails], [f.s.admin])
+
+    def test_kernel_log_line_is_parsed(self):
+        line = ("6,2101,7791234,-;oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),"
+                "cpuset=user.slice,mems_allowed=0,oom_memcg=/user.slice/user-1000.slice,"
+                "task_memcg=/user.slice/user-1000.slice/session-12.scope,task=python3,"
+                "pid=10635,uid=1000")
+        self.assertEqual(fs.OOM_RE.search(line).groups(),
+                         ("/user.slice/user-1000.slice", "python3"))
 
     def test_dropins(self):
         f = Fake()
@@ -160,6 +187,40 @@ class TestBucket(unittest.TestCase):
         self.assertIn("MemorySwapMax=0\n", d["user-.slice.d"])
         self.assertIn("MemoryMax=infinity", d["user-0.slice.d"])
         self.assertRegex(d["user.slice.d"], r"MemoryMax=\d+M")
+
+
+class TestSliceOnly(unittest.TestCase):
+    """The reaper and the mail's process list only look inside user.slice."""
+
+    def setUp(self):
+        import subprocess
+        self.f = Fake()
+        self.inside = subprocess.Popen(["sleep", "60"])
+        self.outside = subprocess.Popen(["sleep", "60"])
+        scope = os.path.join(self.f.slice, "session-1.scope")
+        os.makedirs(scope)
+        with open(os.path.join(scope, "cgroup.procs"), "w") as fh:
+            fh.write("%d\n" % self.inside.pid)
+        self.f.s.exempt = lambda uid: False
+
+    def tearDown(self):
+        for p in (self.inside, self.outside):
+            p.kill()
+            p.wait()
+
+    def test_reaper_leaves_processes_outside_the_slice_alone(self):
+        s = self.f.s
+        s.dry_run = False
+        s.reaper_patterns = [fs.re.compile("sleep 60")]
+        s.reaper_max_age = 0
+        s.reap(fs.time.time() + 10)
+        self.assertEqual(self.inside.wait(timeout=5), -fs.signal.SIGTERM)
+        self.assertIsNone(self.outside.poll())
+
+    def test_process_list_only_has_the_slice(self):
+        out = fs.top_processes(self.f.slice)
+        self.assertIn(str(self.inside.pid), out)
+        self.assertNotIn(str(self.outside.pid), out)
 
 
 class TestConfig(unittest.TestCase):
@@ -174,7 +235,7 @@ class TestMailTexts(unittest.TestCase):
     def sent(self, f):
         out = []
         f.s.send = lambda to, subject, body, cc=None: out.append((subject, body))
-        f.s.notify_user(UID, "oom", f.s.new_user(0), 1e9)
+        f.s.notify_user(UID, "oom", f.s.new_user(0), 1e9, "python3")
         return out[0]
 
     def test_shipped_config_matches_the_built_in_texts(self):
@@ -193,7 +254,7 @@ class TestMailTexts(unittest.TestCase):
     def test_broken_text_falls_back_to_the_default(self):
         f = Fake()
         f.s.messages["oom_body"] = "Hi {nosuchthing}"
-        self.assertIn("ran out of memory", self.sent(f)[1])
+        self.assertIn("largest process was `python3`", self.sent(f)[1])
 
 
 class TestSmtp(unittest.TestCase):
