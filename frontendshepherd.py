@@ -33,6 +33,7 @@ import re
 import signal
 import smtplib
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -374,11 +375,14 @@ class Shepherd:
             subprocess.run([self.sendmail, "-t", "-oi"], input=msg.as_bytes(),
                            timeout=30, check=True)
             return
-        ssl = self.smtp_security == "ssl"
+        use_ssl = self.smtp_security == "ssl"
         port = self.smtp_port or {"ssl": 465, "starttls": 587}.get(self.smtp_security, 25)
-        with (smtplib.SMTP_SSL if ssl else smtplib.SMTP)(self.smtp_host, port, timeout=30) as smtp:
+        tls = ssl.create_default_context()  # verifies the server's certificate
+        smtp = (smtplib.SMTP_SSL(self.smtp_host, port, timeout=30, context=tls) if use_ssl
+                else smtplib.SMTP(self.smtp_host, port, timeout=30))
+        with smtp:
             if self.smtp_security == "starttls":
-                smtp.starttls()
+                smtp.starttls(context=tls)
             if self.smtp_user:
                 with open(self.smtp_password_file) as f:
                     smtp.login(self.smtp_user, f.read().strip())
@@ -758,10 +762,12 @@ def main():
     st.add_argument("user", nargs="?", help="show this user instead of yourself")
     rs = sub.add_parser("reset", help="fill a user's bucket and lift the throttle (as root)")
     rs.add_argument("user", nargs="+")
-    tm = sub.add_parser("testmail", help="send a test mail to check the [mail] settings")
+    tm = sub.add_parser("testmail", help="send a test mail to check the [mail] settings (as root)")
     tm.add_argument("address")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    if args.cmd in ("reset", "testmail") and os.geteuid() != 0:
+        sys.exit("frontendshepherd %s can only be run by root" % args.cmd)
     if args.cmd == "run":
         Shepherd(load_config(args.config), dry_run=args.dry_run).run()
     elif args.cmd == "status":
@@ -776,7 +782,7 @@ def main():
             except KeyError:
                 sys.exit("no such user: %s" % name)
             except OSError as e:
-                sys.exit("cannot request a reset (are you root?): %s" % e)
+                sys.exit("cannot request a reset: %s" % e)
             print("%s: bucket will be reset within %g seconds" % (name, s.interval))
     elif args.cmd == "testmail":
         s = Shepherd(load_config(args.config))
