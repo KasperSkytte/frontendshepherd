@@ -1,0 +1,12 @@
+[Unit]
+Description=frontendshepherd - keeps login nodes responsive
+After=systemd-logind.service
+
+[Service]
+ExecStart=/usr/local/bin/frontendshepherd run
+Restart=on-failure
+RestartSec=10
+StateDirectory=frontendshepherd
+
+[Install]
+WantedBy=multi-user.target
