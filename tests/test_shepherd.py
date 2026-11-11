@@ -196,7 +196,7 @@ class TestBucket(unittest.TestCase):
 
 
 class TestSliceOnly(unittest.TestCase):
-    """The reaper and the mail's process list only look inside user.slice."""
+    """The sheepdog and the mail's process list only look inside user.slice."""
 
     def setUp(self):
         import subprocess
@@ -214,12 +214,12 @@ class TestSliceOnly(unittest.TestCase):
             p.kill()
             p.wait()
 
-    def test_reaper_leaves_processes_outside_the_slice_alone(self):
+    def test_sheepdog_leaves_processes_outside_the_slice_alone(self):
         s = self.f.s
         s.dry_run = False
-        s.reaper_patterns = [fs.re.compile("sleep 60")]
-        s.reaper_max_age = 0
-        s.reap(fs.time.time() + 10)
+        s.sheepdog_patterns = [fs.re.compile("sleep 60")]
+        s.sheepdog_max_age = 0
+        s.sheepdog(fs.time.time() + 10)
         self.assertEqual(self.inside.wait(timeout=5), -fs.signal.SIGTERM)
         self.assertIsNone(self.outside.poll())
 

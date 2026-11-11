@@ -120,7 +120,7 @@ DEFAULTS = {
         "cluster_name": "",
         **MESSAGES,
     },
-    "reaper": {
+    "sheepdog": {
         "enabled": "true",
         "patterns": r"\.vscode-server/",
         "max_age_days": "7",
@@ -207,7 +207,7 @@ def update_bucket(st, used, dt, min_cpus, capacity, refill):
 
 class Shepherd:
     def __init__(self, cp, dry_run=False):
-        g, c, m, mail, r = (cp[s] for s in ("general", "cpu", "memory", "mail", "reaper"))
+        g, c, m, mail, r = (cp[s] for s in ("general", "cpu", "memory", "mail", "sheepdog"))
         self.interval = g.getfloat("interval")
         self.min_uid = g.getint("min_uid")
         self.exempt_users = set(g.get("exempt_users").replace(",", " ").split())
@@ -251,11 +251,11 @@ class Shepherd:
         self.host = socket.gethostname().split(".")[0]
         self.cluster = mail.get("cluster_name") or self.host
 
-        self.reaper_enabled = r.getboolean("enabled")
-        self.reaper_patterns = [re.compile(p) for p in r.get("patterns").split()]
-        self.reaper_max_age = r.getfloat("max_age_days") * 86400
-        self.reaper_interval = r.getfloat("interval_minutes") * 60
-        self.reaper_last = 0.0
+        self.sheepdog_enabled = r.getboolean("enabled")
+        self.sheepdog_patterns = [re.compile(p) for p in r.get("patterns").split()]
+        self.sheepdog_max_age = r.getfloat("max_age_days") * 86400
+        self.sheepdog_interval = r.getfloat("interval_minutes") * 60
+        self.sheepdog_last = 0.0
 
         self.state = {"users": {}, "admin_mails": []}
         self.kmsg = None  # kernel log, opened in run()
@@ -498,9 +498,9 @@ class Shepherd:
                 del users[uid]  # logged out, bucket full, clean record: forget
 
         self.check_oom(now)
-        if self.reaper_enabled and now - self.reaper_last >= self.reaper_interval:
-            self.reaper_last = now
-            self.reap(now)
+        if self.sheepdog_enabled and now - self.sheepdog_last >= self.sheepdog_interval:
+            self.sheepdog_last = now
+            self.sheepdog(now)
         self.save_state()
 
     def ensure_group_kill(self, path):
@@ -576,8 +576,8 @@ class Shepherd:
                 st["events"].append(now)
                 self.notify_user(uid, "oom", st, now, process)
 
-    def reap(self, now):
-        """SIGTERM old processes whose command line matches a reaper pattern."""
+    def sheepdog(self, now):
+        """SIGTERM old processes whose command line matches a sheepdog pattern."""
         boot = next((int(l.split()[1]) for l in (read_file("/proc/stat") or "").splitlines()
                      if l.startswith("btime")), None)
         if boot is None:
@@ -594,14 +594,14 @@ class Shepherd:
             d = "/proc/%d" % pid
             try:
                 cmd = (read_file(d + "/cmdline") or "").replace("\0", " ").strip()
-                if not cmd or not any(p.search(cmd) for p in self.reaper_patterns):
+                if not cmd or not any(p.search(cmd) for p in self.sheepdog_patterns):
                     continue
                 # field 22 of /proc/PID/stat: start time in ticks since boot
                 start = int(read_file(d + "/stat").rsplit(")", 1)[1].split()[19])
                 age = now - (boot + start / hz)
-                if age < self.reaper_max_age:
+                if age < self.sheepdog_max_age:
                     continue
-                log.info("REAP pid %d of %s, %.0f days old: %s%s", pid, username(uid),
+                log.info("SHEEPDOG terminated pid %d of %s, %.0f days old: %s%s", pid, username(uid),
                          age / 86400, cmd[:120], " [dry run]" if self.dry_run else "")
                 if not self.dry_run:
                     os.kill(pid, signal.SIGTERM)

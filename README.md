@@ -6,7 +6,7 @@
 
 **CPU usage** is limited both with a max number of available CPUs per user, but also by using a "bucket" of CPU hours per user (by default 8 CPU hours), so that some burst load is always possible, for example for compiling and installing software, building containers, doing quick data analyses etc. When the bucket is empty, the user's processes are throttled to a bare minimum (by default 2 CPUs), which is still enough for longer `rsync` data transfers and for normal work like coding on the frontend node. The throttle is lifted when the bucket has refilled completely (by default after 4 hours), and it only refills while the user's average CPU usage is below the bare minimum.
 
-**Stale processes** matching a pattern (like `vscode-server` processes!) are automatically killed after running for a max walltime (by default 7 days) to prevent unnecessary processes from accumulating over time.
+**Stale processes** are rounded up by the "sheepdog": processes matching a pattern (like `vscode-server` processes!) are automatically killed after running for a max walltime (by default 7 days) to prevent unnecessary processes from accumulating over time.
 
 `frontendshepherd` only restricts users. No resources are reserved for individual users, they are only limited, so all users still share the whole node and any number of users can be logged in at once. 
 
@@ -37,6 +37,8 @@ Note: A CPU is one hardware thread, as counted by `nproc` and `top`. For example
 | `reserved_gb` | `8` | Memory always unavailable to users to avoid exhausting the node. |
 
 ### Stale or long-running processes
+These are handled by the "sheepdog", and its settings are in the `[sheepdog]` section of the config file.
+
 | Setting | Default | |
 |---|---|---|
 | `patterns` | `\.vscode-server/` | Which processes count as stale: regular expressions matched against the full command line, separated by spaces. The default matches VS Code servers and their file watchers. |
