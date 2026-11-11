@@ -125,13 +125,13 @@ class TestBucket(unittest.TestCase):
 
     def oom(self, f, memcg=None, process="python3"):
         """Let the next check see one kernel OOM kill."""
-        f.s.oom_events = lambda: [(memcg or "/user.slice/user-%s.slice" % UID, process)]
+        own = "/user.slice/user-%s.slice" % UID
+        f.s.oom_events = lambda: [(memcg or own, own + "/session-1.scope", process)]
         f.run(cores=0, seconds=10)
         f.s.oom_events = lambda: []
 
     def test_admin_is_not_copied_by_default(self):
         f = Fake()
-        f.s.cooldown = 0
         f.s.tick(f.now)
         for _ in range(5):
             self.oom(f)
@@ -139,7 +139,6 @@ class TestBucket(unittest.TestCase):
 
     def test_oom_mail_and_repeat_offender_cc(self):
         f = Fake()
-        f.s.cooldown = 0
         f.s.repeat_events = 3
         f.s.tick(f.now)
         self.oom(f)
@@ -149,27 +148,33 @@ class TestBucket(unittest.TestCase):
         self.assertEqual(f.mails[-1][2], f.s.admin)
         self.assertIn("out of memory", f.mails[-1][1])
 
-    def test_mail_cooldown(self):
+    def test_max_mails_per_day(self):
         f = Fake()
+        f.s.max_mails = 3
         f.s.tick(f.now)
+        for _ in range(5):
+            self.oom(f)
+        self.assertEqual(len(f.mails), 3)
+        f.now += 86400          # a day later the user can be mailed again
         self.oom(f)
-        self.oom(f)
-        self.assertEqual(len(f.mails), 1)
+        self.assertEqual(len(f.mails), 4)
 
     def test_oom_is_reported_after_the_users_slice_is_gone(self):
         f = Fake()
         f.s.tick(f.now)
         os.rename(f.slice, f.slice + ".gone")   # everything of the user was killed
-        f.s.oom_events = lambda: [("/user.slice/user-%s.slice" % UID, "python3")]
+        own = "/user.slice/user-%s.slice" % UID
+        f.s.oom_events = lambda: [(own, own + "/session-1.scope", "python3")]
         f.s.tick(f.now + 10)
         self.assertEqual(len(f.mails), 1)
         self.assertEqual(len(f.s.state["users"][UID]["events"]), 1)
 
-    def test_total_limit_mails_the_admin_only(self):
+    def test_total_limit_mails_the_admin_and_the_killed_user(self):
         f = Fake()
         f.s.tick(f.now)
         self.oom(f, memcg="/user.slice")
-        self.assertEqual([m[0] for m in f.mails], [f.s.admin])
+        self.assertEqual([m[0] for m in f.mails], [f.s.admin, UID])
+        self.assertEqual(len(f.s.state["users"][UID]["events"]), 1)
 
     def test_kernel_log_line_is_parsed(self):
         line = ("6,2101,7791234,-;oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),"
@@ -177,7 +182,8 @@ class TestBucket(unittest.TestCase):
                 "task_memcg=/user.slice/user-1000.slice/session-12.scope,task=python3,"
                 "pid=10635,uid=1000")
         self.assertEqual(fs.OOM_RE.search(line).groups(),
-                         ("/user.slice/user-1000.slice", "python3"))
+                         ("/user.slice/user-1000.slice",
+                          "/user.slice/user-1000.slice/session-12.scope", "python3"))
 
     def test_dropins(self):
         f = Fake()

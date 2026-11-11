@@ -98,7 +98,7 @@ Every login already runs in its own systemd cgroup, `user-UID.slice`. At startup
 
 The CPU counter is the kernel's running total of CPU time used by all of the user's processes together. The difference between two readings, divided by the 10 seconds, is the user's average number of CPUs in that interval, so short spikes and dips are averaged out. Above the bare minimum all of the usage is taken from the bucket (not only the part above the bare minimum), below it the bucket refills, and right at it (within 5 %) nothing happens. The throttle goes on only when the bucket is completely empty and off only when it is completely full, so it can never flip back and forth quickly.
 
-Users get an email when they are throttled or when their processes are killed for exceeding the memory limit, at most one of each per day. Admins are not mailed about individual users, only when the total memory limit of the node is reached. I/O is never limited and nothing is ever killed for using CPU. Root and system accounts are exempt.
+Users get an email when they are throttled or when their processes are killed for exceeding the memory limit, every time it happens (at most 100 mails per user per day). Admins are not mailed about individual users, only when the total memory limit of the node is reached. I/O is never limited and nothing is ever killed for using CPU. Root and system accounts are exempt.
 
 There is no limit on the number of users logged in at once. Nothing is reserved per user, the limits are only ceilings, so the sum of all users' limits can be much larger than the node. The total memory limit for all users is what protects the node when many users are busy at the same time.
 

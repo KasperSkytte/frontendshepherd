@@ -113,7 +113,7 @@ DEFAULTS = {
         "from": "root",
         "admin": "root",
         "address": "{user}",
-        "cooldown_hours": "24",
+        "max_mails_per_day": "100",
         "repeat_events": "0",
         "repeat_days": "7",
         "cluster_name": "",
@@ -130,7 +130,7 @@ DEFAULTS = {
 log = logging.getLogger("frontendshepherd")
 
 # The kernel's log line for an out-of-memory kill in a cgroup
-OOM_RE = re.compile(r"oom-kill:.*oom_memcg=(/[^,]*),.*task=([^,]*),pid=")
+OOM_RE = re.compile(r"oom-kill:.*oom_memcg=(/[^,]*),task_memcg=(/[^,]*),task=([^,]*),pid=")
 
 
 # --------------------------------------------------------------------------
@@ -244,7 +244,7 @@ class Shepherd:
         self.mail_from = mail.get("from")
         self.admin = mail.get("admin")
         self.address = mail.get("address")
-        self.cooldown = mail.getfloat("cooldown_hours") * 3600
+        self.max_mails = mail.getint("max_mails_per_day")
         self.repeat_events = mail.getint("repeat_events")
         self.repeat_window = mail.getfloat("repeat_days") * 86400
         self.host = socket.gethostname().split(".")[0]
@@ -256,7 +256,7 @@ class Shepherd:
         self.reaper_interval = r.getfloat("interval_minutes") * 60
         self.reaper_last = 0.0
 
-        self.state = {"users": {}, "admin_mailed": 0}
+        self.state = {"users": {}, "admin_mails": []}
         self.kmsg = None  # kernel log, opened in run()
         self.stop = threading.Event()
 
@@ -283,7 +283,7 @@ class Shepherd:
 
     def new_user(self, now):
         return {"level": self.capacity, "throttled": False, "usage": None,
-                "ts": now, "cores": 0.0, "events": [], "mailed": {}}
+                "ts": now, "cores": 0.0, "events": [], "mails": []}
 
     def exempt(self, uid):
         return uid < self.min_uid or username(uid) in self.exempt_users
@@ -384,10 +384,20 @@ class Shepherd:
                     smtp.login(self.smtp_user, f.read().strip())
             smtp.send_message(msg)
 
+    def may_mail(self, sent, now):
+        """`sent` holds the times of earlier mails to one recipient. Record
+        one more, unless max_mails_per_day were sent in the last 24 hours."""
+        sent[:] = [t for t in sent if now - t < 86400]
+        if len(sent) >= self.max_mails:
+            return False
+        sent.append(now)
+        return True
+
     def notify_user(self, uid, kind, st, now, process=""):
-        if now - st["mailed"].get(kind, 0) < self.cooldown:
+        if not self.may_mail(st.setdefault("mails", []), now):
+            log.warning("no mail to %s: already %d mails in the last 24 hours",
+                        username(uid), self.max_mails)
             return
-        st["mailed"][kind] = now
         user = username(uid)
         # repeat_events = 0 (the default): the admin is never copied
         repeat = 0 < self.repeat_events <= len(st["events"])
@@ -513,7 +523,7 @@ class Shepherd:
 
     def oom_events(self):
         """Out-of-memory kills the kernel has logged since the last call, as
-        (cgroup that hit its limit, name of the process chosen) pairs. The
+        (cgroup that hit its limit, cgroup of the process chosen, its name). The
         kernel log is used because it still names the user after all their
         processes, and with them their cgroup, are gone."""
         out = []
@@ -528,34 +538,39 @@ class Shepherd:
                 break
             m = OOM_RE.search(record)
             if m:
-                out.append((m.group(1), m.group(2)))
+                out.append(m.groups())
         return out
 
     def check_oom(self, now):
         seen = {}
-        for memcg, process in self.oom_events():
-            seen.setdefault(memcg, process)  # one report per cgroup and check
-        for memcg, process in seen.items():
-            m = re.match(r"/user\.slice/user-(\d+)\.slice$", memcg)
-            if m and not self.exempt(int(m.group(1))):
-                uid = m.group(1)
-                st = self.state["users"].setdefault(uid, self.new_user(now))
-                st["events"].append(now)
-                log.info("OOM %s (uid %s): over the memory limit, processes killed "
-                         "(largest: %s)", username(uid), uid, process)
-                self.notify_user(uid, "oom", st, now, process)
-            elif memcg == "/user.slice":
-                log.warning("OOM all users together hit the total memory limit; the "
-                            "user with the largest process (%s) was killed", process)
-                if now - self.state["admin_mailed"] >= self.cooldown:
-                    self.state["admin_mailed"] = now
+        for memcg, victim_cg, process in self.oom_events():
+            seen.setdefault(memcg, (victim_cg, process))  # one report per cgroup and check
+        for memcg, (victim_cg, process) in seen.items():
+            total = memcg == "/user.slice"  # the limit for all users together
+            m = re.match(r"/user\.slice/user-(\d+)\.slice", victim_cg if total else memcg + "/")
+            if not (total or m):
+                continue  # not one of ours
+            uid = m.group(1) if m else None
+            name = username(uid) if uid else "unknown"
+            if total:
+                log.warning("OOM all users together hit the total memory limit; all "
+                            "processes of %s were killed (largest process on the node: %s)",
+                            name, process)
+                if self.may_mail(self.state.setdefault("admin_mails", []), now):
                     self.send(self.admin,
                               "[%s] %s: total user memory limit reached" % (self.cluster, self.host),
                               "All users together hit the memory limit of user.slice on %s.\n"
-                              "The kernel killed all processes of the user with the largest\n"
+                              "The kernel killed all processes of %s, who had the largest\n"
                               "process (%s). See `journalctl -k` for details and\n"
                               "`frontendshepherd status --all` for current usage.\n"
-                              % (self.host, process))
+                              % (self.host, name, process))
+            else:
+                log.info("OOM %s (uid %s): over the memory limit, all processes killed "
+                         "(largest: %s)", name, uid, process)
+            if uid and not self.exempt(int(uid)):
+                st = self.state["users"].setdefault(uid, self.new_user(now))
+                st["events"].append(now)
+                self.notify_user(uid, "oom", st, now, process)
 
     def reap(self, now):
         """SIGTERM old processes whose command line matches a reaper pattern."""
