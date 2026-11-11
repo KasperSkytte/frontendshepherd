@@ -1,16 +1,16 @@
 # frontendshepherd
 
-`frontendshepherd` is a tool to automatically throttle and limit the resources (CPU+memory) available to users on shared frontend nodes in computing clusters. This prevents situations where one or a few users can block access for other users by either utilizing all CPU cores, or even worse crashing the node due to memory starvation. When users exceed limits they will be throttled and receive an email.
+`frontendshepherd` is a tool to automatically limit the resources (CPU and memory) available to each user on the shared frontend (or access/login) nodes of a computing cluster to keep them responsive. It prevents situations where one or a few users block access for everyone else by running large computing jobs directly on a frontend node, accidentally or deliberately, instead of submitting them as batch jobs to the dedicated compute nodes. Such jobs can use all CPU cores or, even worse, crash the node due to memory starvation. Users who exceed the limits are restricted automatically and receive an email explaining why.
 
-The total amount of memory available to all users is limited (by default 8GB is always available to the host), and a hard limit per user (by default 16GB) is also enforced, where processes will be killed if the limit is exceeded.
+**Memory usage** is limited with a hard limit per user (by default 16GB), where the user's largest process is killed if the limit is exceeded. The total amount of memory available to all users together is also limited (by default 8GB is always kept for the host), so the node itself can never run out.
 
-CPU load "buckets" are used to ensure that some burst load is always possible to allow for example software compilation and installation, building containers etc. The user bucket drains after a defined amount of CPU hours are used (by default 8 CPU hours) and the user's processes are then throttled to a bare minimum (by default 2 CPUs to enable longer `rsync` data transfers without also affecting the user's ability to still do work like coding on the frontend node). The throttle is lifted when the bucket has refilled completely (by default after 4 hours), and it only refills once the heavy processes have ended.
+**CPU usage** is limited with a "bucket" of CPU hours per user (by default 8 CPU hours), so that some burst load is always possible, for example for compiling and installing software, building containers etc. When the bucket is empty, the user's processes are throttled to a bare minimum (by default 2 CPUs), which is still enough for longer `rsync` data transfers and for normal work like coding on the frontend node. The throttle is lifted when the bucket has refilled completely (by default after 4 hours), and it only refills while the user's average CPU usage is below the bare minimum.
 
-Long-running or stale processes matching a pattern (like `vscode-server` processes!) are automatically killed after a defined time (by default 7 days) to prevent unnecessary processes from accumulating over time.
+**Stale processes** matching a pattern (like `vscode-server` processes!) are automatically killed after a defined time (by default 7 days) to prevent unnecessary processes from accumulating over time.
 
-`frontendshepherd` is completely independent from any specific workflow scheduling system (like SLURM or PBS, etc) and is thus compatible with any computing cluster.
+`frontendshepherd` only restricts users. It never submits jobs on their behalf and never limits I/O, and it is completely independent of any specific workload scheduling system (like SLURM or PBS, etc) and is thus compatible with any computing cluster.
 
-`frontendshepherd` is designed to be as simple as possible ([KISS](https://en.wikipedia.org/wiki/KISS_principle)). One Python file, one config file, one systemd unit. Needs cgroup v2, systemd and Python 3.6 or later, nothing else.
+`frontendshepherd` is designed to be as simple as possible ([KISS](https://en.wikipedia.org/wiki/KISS_principle)): one Python file, one config file, one systemd unit.
 
 ![How frontendshepherd limits CPU and memory per user](docs/flowchart.svg)
 
@@ -23,8 +23,8 @@ The most important settings are listed here. The rest (mail server, the mail tex
 ### CPUs
 | Setting | Default | |
 |---|---|---|
-| `min_cpus` | `2` | Bare minimum CPUs. Using this much or less is never throttled or limited. It is also what a throttled user is limited to |
-| `burst_cpus` | `8` | CPU burst ceiling. The most one user can use at any moment. Higher CPU utilization drains the user bucket faster |
+| `min_cpus` | `2` | Bare minimum number of CPUs always available to any user. Using this much or less is never throttled or limited. It is also what a throttled user is limited to |
+| `max_cpus` | `8` | Max CPUs. The most one user can use at any moment, also for short bursts. Higher CPU utilization drains the user bucket faster |
 | `bucket_cpu_hours` | `8` | CPU bucket. Any usage above the bare minimum is taken from the bucket. `8 CPUs` for 1 hour or `4 CPUs` for 2 hours empties it, and throttling kicks in |
 | `refill_hours` | `4` | Time for an empty bucket to refill completely. It only refills while the user's CPU usage is below the bare minimum, so not while a throttled job is still running flat out. A throttled user is only released when the bucket is full again |
 
@@ -58,6 +58,12 @@ Say a user starts a large `minimap2` mapping with 32 threads. It is held at 8 CP
 Users get an email when they are throttled or when a process is killed for memory, at most one of each per day. The admin is copied from the third time in a week. I/O is never limited and nothing is ever killed for using CPU. Root and system accounts are exempt.
 
 There is no limit on the number of users logged in at once. Nothing is reserved per user, the limits are only ceilings, so the sum of all users' limits can be much larger than the node. The total memory limit for all users is what protects the node when many users are busy at the same time.
+
+## Requirements
+
+- Linux with cgroup v2 (the default on all current distributions)
+- systemd
+- Python 3.6 or later, no extra packages
 
 ## Installation
 

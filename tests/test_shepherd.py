@@ -23,7 +23,7 @@ class Fake:
         cp = fs.load_config("/nonexistent")
         cp["general"]["cgroup_root"] = os.path.join(self.tmp.name, "cg")
         cp["general"]["state_dir"] = self.tmp.name
-        cp["cpu"].update(burst_cpus="16", min_cpus="2", refill_hours="4")
+        cp["cpu"].update(max_cpus="16", min_cpus="2", refill_hours="4")
         cp["memory"].update(user_max_gb="32", reserved_gb="1")
         self.cp = cp
         self.s = fs.Shepherd(cp, dry_run=True)

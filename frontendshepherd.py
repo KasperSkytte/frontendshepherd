@@ -53,7 +53,7 @@ of {bucket_cpu_hours} CPU-hours, so together they are now limited to {min_cpus} 
 Nothing has been killed.
 
 Login nodes are shared by everyone. Short bursts (compiling, installing
-software, building containers) are fine, up to {burst_cpus} CPUs, but not for
+software, building containers) are fine, up to {max_cpus} CPUs, but not for
 long. Long or heavy work belongs in a batch job on the compute nodes.
 
 The limit is lifted automatically when your allowance has refilled
@@ -90,7 +90,7 @@ DEFAULTS = {
     },
     "cpu": {
         "min_cpus": "2",
-        "burst_cpus": "8",
+        "max_cpus": "8",
         "bucket_cpu_hours": "8",
         "refill_hours": "4",
         "reserved_cpus": "2",
@@ -213,10 +213,10 @@ class Shepherd:
         self.ncpu = os.cpu_count() or 1
         self.min_cpus = c.getfloat("min_cpus")
         self.reserved_cores = c.getfloat("reserved_cpus")
-        self.burst = min(self.ncpu, c.getfloat("burst_cpus"))
+        self.burst = min(self.ncpu, c.getfloat("max_cpus"))
         if self.burst <= self.min_cpus:  # node smaller than the config assumes
             self.min_cpus = self.burst / 2
-            log.warning("burst_cpus is not above min_cpus on this node; "
+            log.warning("max_cpus is not above min_cpus on this node; "
                         "using min_cpus = %.3g", self.min_cpus)
         self.capacity = c.getfloat("bucket_cpu_hours") * 3600  # CPU-seconds
         self.refill_hours = c.getfloat("refill_hours")
@@ -384,7 +384,7 @@ class Shepherd:
         repeat = len(st["events"]) >= self.repeat_events
         values = {
             "user": user, "host": self.host, "cluster": self.cluster,
-            "min_cpus": "%.3g" % self.min_cpus, "burst_cpus": "%.3g" % self.burst,
+            "min_cpus": "%.3g" % self.min_cpus, "max_cpus": "%.3g" % self.burst,
             "bucket_cpu_hours": "%.3g" % (self.capacity / 3600),
             "refill_hours": "%.3g" % self.refill_hours,
             "user_max_gb": "%.3g" % self.user_max_gb,
