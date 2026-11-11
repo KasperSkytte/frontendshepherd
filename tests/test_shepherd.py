@@ -80,6 +80,17 @@ class TestBucket(unittest.TestCase):
         self.assertFalse(st["throttled"])
         self.assertEqual(st["level"], f.s.capacity)
 
+    def test_admin_reset(self):
+        f = Fake()
+        f.s.tick(f.now)
+        st = f.run(cores=16, seconds=30 * 60)
+        self.assertTrue(st["throttled"])
+        open(os.path.join(f.tmp.name, "reset-" + UID), "w").close()
+        st = f.run(cores=1, seconds=10)
+        self.assertFalse(st["throttled"])
+        self.assertEqual(st["level"], f.s.capacity)
+        self.assertFalse(os.path.exists(os.path.join(f.tmp.name, "reset-" + UID)))
+
     def test_bucket_arithmetic(self):
         for cores, hours in ((8, 1), (4, 2)):
             f = Fake()
@@ -114,9 +125,18 @@ class TestBucket(unittest.TestCase):
         f.s.tick(f.now + 10)
         self.assertEqual(f.s.state["users"], {})
 
+    def test_admin_is_not_copied_by_default(self):
+        f = Fake()
+        f.s.cooldown = 0
+        f.s.tick(f.now)
+        for n in range(1, 6):
+            f.run(cores=0, seconds=10, ooms=n)
+        self.assertEqual([m[2] for m in f.mails], [None] * 5)
+
     def test_oom_mail_and_repeat_offender_cc(self):
         f = Fake()
         f.s.cooldown = 0
+        f.s.repeat_events = 3
         f.s.tick(f.now)
         f.run(cores=0, seconds=10, ooms=1)
         f.run(cores=0, seconds=10, ooms=2)

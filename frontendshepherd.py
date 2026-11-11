@@ -111,7 +111,7 @@ DEFAULTS = {
         "admin": "root",
         "address": "{user}",
         "cooldown_hours": "24",
-        "repeat_events": "3",
+        "repeat_events": "0",
         "repeat_days": "7",
         "cluster_name": "",
         **MESSAGES,
@@ -205,7 +205,8 @@ class Shepherd:
         self.min_uid = g.getint("min_uid")
         self.exempt_users = set(g.get("exempt_users").replace(",", " ").split())
         self.dry_run = dry_run or g.getboolean("dry_run")
-        self.state_file = os.path.join(g.get("state_dir"), "state.json")
+        self.state_dir = g.get("state_dir")
+        self.state_file = os.path.join(self.state_dir, "state.json")
         self.user_slice = os.path.join(g.get("cgroup_root"), "user.slice")
         self.tasks_max = g.getint("user_tasks_max")
 
@@ -381,7 +382,8 @@ class Shepherd:
             return
         st["mailed"][kind] = now
         user = username(uid)
-        repeat = len(st["events"]) >= self.repeat_events
+        # repeat_events = 0 (the default): the admin is never copied
+        repeat = 0 < self.repeat_events <= len(st["events"])
         values = {
             "user": user, "host": self.host, "cluster": self.cluster,
             "min_cpus": "%.3g" % self.min_cpus, "max_cpus": "%.3g" % self.burst,
@@ -408,9 +410,24 @@ class Shepherd:
 
     # ---- main loop ------------------------------------------------------
 
+    def apply_resets(self):
+        """`frontendshepherd reset USER` leaves a file reset-UID in the state
+        directory. Fill that user's bucket and lift the throttle."""
+        for path in glob.glob(os.path.join(self.state_dir, "reset-*")):
+            uid = os.path.basename(path)[len("reset-"):]
+            try:
+                os.remove(path)
+            except OSError:
+                continue
+            st = self.state["users"].get(uid)
+            if st:
+                st["level"], st["throttled"] = self.capacity, False
+            log.info("RESET %s (uid %s): bucket filled by an admin", username(uid), uid)
+
     def tick(self, now=None):
         now = now or time.time()
         users = self.state["users"]
+        self.apply_resets()
         present = {}
         for path in glob.glob(os.path.join(self.user_slice, "user-*.slice")):
             m = re.search(r"user-(\d+)\.slice$", path)
@@ -647,6 +664,8 @@ def main():
     st.add_argument("-a", "--all", action="store_true",
                     help="show all users (the default for root)")
     st.add_argument("user", nargs="?", help="show this user instead of yourself")
+    rs = sub.add_parser("reset", help="fill a user's bucket and lift the throttle (as root)")
+    rs.add_argument("user", nargs="+")
     tm = sub.add_parser("testmail", help="send a test mail to check the [mail] settings")
     tm.add_argument("address")
     args = ap.parse_args()
@@ -656,6 +675,17 @@ def main():
     elif args.cmd == "status":
         logging.disable(logging.WARNING)
         status(Shepherd(load_config(args.config)), args.user, args.all)
+    elif args.cmd == "reset":
+        s = Shepherd(load_config(args.config))
+        for name in args.user:
+            try:
+                uid = pwd.getpwnam(name).pw_uid
+                open(os.path.join(s.state_dir, "reset-%d" % uid), "w").close()
+            except KeyError:
+                sys.exit("no such user: %s" % name)
+            except OSError as e:
+                sys.exit("cannot request a reset (are you root?): %s" % e)
+            print("%s: bucket will be reset within %g seconds" % (name, s.interval))
     elif args.cmd == "testmail":
         s = Shepherd(load_config(args.config))
         try:
