@@ -43,19 +43,19 @@
   <text class="yn" x="181" y="170">No</text>
   <rect class="ok" x="20" y="140" width="150" height="80" rx="8"/>
   <text class="b" x="95" y="166">No restrictions</text>
-  <text x="95" y="187">The CPU bucket</text>
-  <text x="95" y="205">is not drained.</text>
+  <text x="95" y="187">The CPU budget</text>
+  <text x="95" y="205">is not used.</text>
 
   <path class="line" d="M330 240V288"/>
   <text class="yn" x="352" y="268">Yes</text>
   <rect class="box" x="170" y="290" width="320" height="86" rx="8"/>
-  <text class="b" x="330" y="316">The user's CPU-hour bucket drains</text>
-  <text x="330" y="337">A full bucket holds <tspan class="m">bucket_cpu_hours</tspan>.</text>
+  <text class="b" x="330" y="316">The user's CPU budget is used</text>
+  <text x="330" y="337">The budget is <tspan class="m">budget_cpu_hours</tspan>.</text>
   <text x="330" y="357">Never more than <tspan class="m">max_cpus</tspan> CPUs at once.</text>
 
   <path class="line" d="M330 376V418"/>
   <path class="ask" d="M330 420L450 470L330 520L210 470z"/>
-  <text x="330" y="475">Is the bucket empty?</text>
+  <text x="330" y="475">Is the budget used up?</text>
 
   <path class="line" d="M450 470H540V180H472"/>
   <text class="yn" x="470" y="460">No</text>
@@ -69,13 +69,13 @@
 
   <path class="line" d="M330 658V698"/>
   <rect class="box" x="160" y="700" width="340" height="86" rx="8"/>
-  <text class="b" x="330" y="726">The bucket refills slowly</text>
+  <text class="b" x="330" y="726">The budget recovers slowly</text>
   <text x="330" y="747">Only while the user stays below <tspan class="m">min_cpus</tspan>.</text>
-  <text x="330" y="767">From empty to full takes <tspan class="m">refill_hours</tspan>.</text>
+  <text x="330" y="767">Full recovery takes <tspan class="m">refill_hours</tspan>.</text>
 
   <path class="line" d="M330 786V818"/>
   <rect class="ok" x="160" y="820" width="340" height="62" rx="8"/>
-  <text class="b" x="330" y="846">The bucket is full again</text>
+  <text class="b" x="330" y="846">The whole budget is available again</text>
   <text x="330" y="866">The throttle is lifted.</text>
   <path class="line" d="M160 851H95V222"/>
 

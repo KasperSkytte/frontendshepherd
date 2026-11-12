@@ -47,7 +47,7 @@ class Fake:
         return self.s.state["users"].get(UID)
 
 
-class TestBucket(unittest.TestCase):
+class TestBudget(unittest.TestCase):
     def test_light_use_is_free(self):
         f = Fake()
         f.s.tick(f.now)
@@ -103,7 +103,7 @@ class TestBucket(unittest.TestCase):
         f.s.save_state()
         self.assertFalse(os.path.exists(own))
 
-    def test_bucket_arithmetic(self):
+    def test_budget_arithmetic(self):
         for cores, hours in ((8, 1), (4, 2)):
             f = Fake()
             f.s.tick(f.now)

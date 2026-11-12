@@ -8,11 +8,11 @@ already gets (user.slice/user-UID.slice):
    user, a memory cap for all users together, a CPU ceiling per user.
    The kernel enforces these; they hold even if this daemon is not running.
 
-2. A CPU bucket per user, run by this daemon. Using up to `min_cpus` is
-   always free. Any higher usage is taken from the user's bucket of
-   `bucket_cpu_hours`. When it is empty the user is throttled to `min_cpus`
-   until the bucket has refilled completely, which takes `refill_hours`.
-   The bucket only refills while usage is below `min_cpus`, so a job that
+2. A CPU budget per user, run by this daemon. Using up to `min_cpus` is
+   always free. Any higher usage is charged to the user's budget of
+   `budget_cpu_hours`. When it is used up the user is throttled to `min_cpus`
+   until the whole budget is available again, which takes `refill_hours`.
+   The budget only recovers while usage is below `min_cpus`, so a job that
    keeps running flat out at the throttled limit stays throttled.
 
 A "CPU" here is a logical CPU as counted by nproc and top: one hardware
@@ -50,7 +50,7 @@ MESSAGES = {
     "throttle_body": """\
 Hi {user},
 
-You have just used up your max allowed burst CPU usage of {bucket_cpu_hours} CPU-hours
+You have just used up your max allowed burst CPU usage of {budget_cpu_hours} CPU-hours
 on the login node {host}, so all your processes together are now limited
 to max {min_cpus} CPUs. Nothing has been killed.
 
@@ -96,7 +96,7 @@ DEFAULTS = {
     "cpu": {
         "min_cpus": "2",
         "max_cpus": "8",
-        "bucket_cpu_hours": "8",
+        "budget_cpu_hours": "8",
         "refill_hours": "4",
         "reserved_cpus": "2",
     },
@@ -190,17 +190,19 @@ def username(uid):
         return str(uid)
 
 
-def update_bucket(st, used, dt, min_cpus, capacity, refill):
-    """Advance one user's bucket by dt seconds in which `used` CPU-seconds
+def update_budget(st, used, dt, min_cpus, capacity, refill):
+    """Advance one user's CPU budget by dt seconds in which `used` CPU-seconds
     were consumed. Returns "throttle", "release" or None.
 
     `used / dt` is the average number of CPUs over the interval.
-    - above min_cpus: the usage is taken from the bucket in full, so
+    - above min_cpus: the usage is charged to the budget in full, so
       8 CPUs for 1 hour is exactly 8 CPU-hours
-    - below min_cpus: the bucket refills by `refill` CPU-seconds per second
+    - below min_cpus: the budget recovers by `refill` CPU-seconds per second
     - right at min_cpus (within 5 %): neither. This is where a throttled
       job that wants more CPU sits, pinned at its limit, so it gets no
-      refill until it ends or is stopped."""
+      budget back until it ends or is stopped.
+
+    st["level"] is what is left of the budget, in CPU-seconds."""
     if used > min_cpus * dt * 1.05:
         st["level"] = max(0.0, st["level"] - used)
     elif used < min_cpus * dt * 0.95:
@@ -239,7 +241,7 @@ class Shepherd:
             self.min_cpus = self.burst / 2
             log.warning("max_cpus is not above min_cpus on this node; "
                         "using min_cpus = %.3g", self.min_cpus)
-        self.capacity = c.getfloat("bucket_cpu_hours") * 3600  # CPU-seconds
+        self.capacity = c.getfloat("budget_cpu_hours") * 3600  # CPU-seconds
         self.refill_hours = c.getfloat("refill_hours")
         self.refill = self.capacity / (self.refill_hours * 3600)  # CPU-seconds per second
 
@@ -439,7 +441,7 @@ class Shepherd:
         values = {
             "user": user, "host": self.host, "cluster": self.cluster,
             "min_cpus": "%.3g" % self.min_cpus, "max_cpus": "%.3g" % self.burst,
-            "bucket_cpu_hours": "%.3g" % (self.capacity / 3600),
+            "budget_cpu_hours": "%.3g" % (self.capacity / 3600),
             "refill_hours": "%.3g" % self.refill_hours,
             "user_max_gb": "%.3g" % self.user_max_gb,
             "events": len(st["events"]), "days": "%.3g" % (self.repeat_window / 86400),
@@ -466,7 +468,7 @@ class Shepherd:
 
     def apply_resets(self):
         """`frontendshepherd reset USER` leaves a file reset-UID in the state
-        directory. Fill that user's bucket and lift the throttle."""
+        directory. Give that user their whole budget back and lift the throttle."""
         for path in glob.glob(os.path.join(self.state_dir, "reset-*")):
             uid = os.path.basename(path)[len("reset-"):]
             try:
@@ -476,7 +478,7 @@ class Shepherd:
             st = self.state["users"].get(uid)
             if st:
                 st["level"], st["throttled"] = self.capacity, False
-            log.info("RESET %s (uid %s): bucket filled by an admin", username(uid), uid)
+            log.info("RESET %s (uid %s): CPU budget restored by an admin", username(uid), uid)
 
     def tick(self, now=None):
         now = now or time.time()
@@ -509,24 +511,24 @@ class Shepherd:
                 st["usage"] = usage
             st["cores"] = round(used / dt, 2) if dt > 0 else 0.0
 
-            event = update_bucket(st, used, dt, self.min_cpus, self.capacity, self.refill)
+            event = update_budget(st, used, dt, self.min_cpus, self.capacity, self.refill)
             st["events"] = [t for t in st["events"] if now - t < self.repeat_window]
             name = username(uid)
             if event == "throttle":
                 st["events"].append(now)
-                log.info("THROTTLE %s (uid %s): bucket empty, limiting to %.3g CPUs "
+                log.info("THROTTLE %s (uid %s): CPU budget used up, limiting to %.3g CPUs "
                          "(%d events in window)%s", name, uid, self.min_cpus,
                          len(st["events"]), " [dry run]" if self.dry_run else "")
                 self.notify_user(uid, "throttle", st, now)
             elif event == "release":
-                log.info("RELEASE %s (uid %s): bucket is full again", name, uid)
+                log.info("RELEASE %s (uid %s): the whole CPU budget is available again", name, uid)
 
             if usage is not None:
                 self.ensure_quota(uid, path,
                                   self.min_cpus if st["throttled"] else self.burst)
                 self.ensure_group_kill(path)
             elif st["level"] >= self.capacity and not st["events"]:
-                del users[uid]  # logged out, bucket full, clean record: forget
+                del users[uid]  # logged out, nothing used, clean record: forget
 
         self.check_oom(now)
         if self.sheepdog_enabled and now - self.sheepdog_last >= self.sheepdog_interval:
@@ -640,8 +642,8 @@ class Shepherd:
                 continue  # process went away while we looked at it
 
     def policy(self):
-        return ("%.3g CPUs always free, burst up to %.3g CPUs, bucket of %.3g "
-                "CPU-hours refilling in %.3g hours, %.3g GB memory per user"
+        return ("%.3g CPUs always free, burst up to %.3g CPUs, budget of %.3g "
+                "CPU-hours restored in %.3g hours, %.3g GB memory per user"
                 % (self.min_cpus, self.burst, self.capacity / 3600,
                    self.refill_hours, self.user_max_gb))
 
@@ -757,10 +759,11 @@ def status(s, user=None, show_all=False):
         if st["cores"] < s.min_cpus * 0.95:
             when = "in about %d min" % ((s.capacity - level) / s.refill / 60)
         else:
-            when = "NOT refilling while you use %.3g CPUs or more" % s.min_cpus
-        state = "THROTTLED to %.3g CPU(s) until the bucket is full again, %s" % (s.min_cpus, when)
+            when = "which does NOT happen while you use %.3g CPUs or more" % s.min_cpus
+        state = ("THROTTLED to %.3g CPU(s) until your whole CPU budget is available again, %s"
+                 % (s.min_cpus, when))
     elif st["cores"] > s.min_cpus * 1.05:
-        state = "ok; at this rate the bucket is empty in about %d min" % (
+        state = "ok; at this rate your CPU budget is used up in about %d min" % (
             level / st["cores"] / 60)
     else:
         state = "ok"
@@ -769,8 +772,8 @@ def status(s, user=None, show_all=False):
         ("State", state),
         ("CPU in use", "%.1f CPUs (up to %.3g allowed, %.3g are free of charge)"
          % (st["cores"], s.burst, s.min_cpus)),
-        ("CPU bucket", "%d%% full (%.1f of %.3g CPU-hours)"
-         % (100 * level / s.capacity, level / 3600, hours)),
+        ("CPU budget", "%d%% used (%.1f of %.3g CPU-hours)"
+         % (100 * (s.capacity - level) / s.capacity, (s.capacity - level) / 3600, hours)),
         ("Memory", "%.1f of %.3g GB" % (mem or 0, s.user_max_gb)),
         ("Warnings", "%d in the last %.3g days" % (len(st["events"]), s.repeat_window / 86400)),
     ]
@@ -781,12 +784,12 @@ def status(s, user=None, show_all=False):
 def status_all(s):
     users = s.state["users"]
     print("Policy on %s: %s%s\n" % (s.host, s.policy(), "  [DRY RUN]" if s.dry_run else ""))
-    fmt = "%-16s %7s %8s %9s %10s  %s"
-    print(fmt % ("USER", "CPUS", "BUCKET", "MEM (GB)", "WARNINGS", "STATE"))
+    fmt = "%-16s %7s %12s %9s %10s  %s"
+    print(fmt % ("USER", "CPUS", "BUDGET USED", "MEM (GB)", "WARNINGS", "STATE"))
     for uid, st in sorted(users.items(), key=lambda kv: kv[1]["level"]):
         mem = memory_gb(s, uid)
         print(fmt % (username(uid)[:16], "%.1f" % st["cores"],
-                     "%d%%" % min(100, 100 * st["level"] / s.capacity),
+                     "%d%%" % max(0, 100 - 100 * st["level"] / s.capacity),
                      "-" if mem is None else "%.1f" % mem,
                      len(st["events"]),
                      "THROTTLED" if st["throttled"] else "ok"))
@@ -807,7 +810,7 @@ def main():
         run = sub.add_parser("run", help="run the daemon")
         run.add_argument("--dry-run", action="store_true",
                          help="log what would happen, limit nothing, send no mail")
-        rs = sub.add_parser("reset", help="fill a user's bucket and lift the throttle")
+        rs = sub.add_parser("reset", help="give a user their whole CPU budget back and lift the throttle")
         rs.add_argument("user", nargs="+")
         tm = sub.add_parser("testmail", help="send a test mail to check the [mail] settings")
         tm.add_argument("address")
@@ -831,7 +834,7 @@ def main():
                 sys.exit("no such user: %s" % name)
             except OSError as e:
                 sys.exit("cannot request a reset: %s" % e)
-            print("%s: bucket will be reset within %g seconds" % (name, s.interval))
+            print("%s: CPU budget will be reset within %g seconds" % (name, s.interval))
     elif args.cmd == "testmail":
         s = Shepherd(load_config(args.config))
         try:
