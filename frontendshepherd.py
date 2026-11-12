@@ -50,35 +50,36 @@ MESSAGES = {
     "throttle_body": """\
 Hi {user},
 
-Your processes on the login node {host} have used up your CPU allowance
-of {bucket_cpu_hours} CPU-hours, so together they are now limited to {min_cpus} CPUs.
-Nothing has been killed.
+You have just used up your max allowed burst CPU usage of {bucket_cpu_hours} CPU-hours
+on the login node {host}, so all your processes together are now limited
+to max {min_cpus} CPUs. Nothing has been killed.
 
-Login nodes are shared by everyone. Short bursts (compiling, installing
-software, building containers) are fine, up to {max_cpus} CPUs, but not for
-long. Long or heavy work belongs in a batch job on the compute nodes.
+Login nodes are shared by everyone. Short burst workloads (e.g. compiling,
+installing software, building containers, developing code etc.) are allowed
+with up to max {max_cpus} CPUs at once, but not for extended periods of time.
+To prevent impacting the responsiveness of the login nodes, please submit
+long and heavy work as batch jobs, so that it runs on the dedicated compute
+nodes.
 
-The limit is lifted automatically when your allowance has refilled
-completely, which takes {refill_hours} hours. It only refills while you use
-less than {min_cpus} CPUs, so it will not refill while a heavy job is still
-running. Run `frontendshepherd status` on the login node to follow it.
+The limit is lifted automatically once your processes have used less than
+{min_cpus} CPUs for a total of {refill_hours} hours. Run `frontendshepherd status` on the
+login node to check the status.
 
 Your busiest processes right now:
 
 {processes}""",
-    "oom_subject": "[{cluster}] Your processes on {host} were killed (out of memory)",
+    "oom_subject": "[{cluster}] Your processes on {host} were killed (too much memory usage)",
     "oom_body": """\
 Hi {user},
 
 All your processes on the login node {host} were killed, and you were
-logged out, because together they used more memory than allowed. The
-largest process was `{process}`.
+logged out, because together they used more memory than allowed (max
+{user_max_gb} GB per user, less if the login node is running out of memory).
+The largest process was `{process}`.
 
-Each user may use at most {user_max_gb} GB on a login node (files in
-/dev/shm count too), and all users together share what the node has.
-
-Work that needs this much memory belongs in a batch job on the compute
-nodes.""",
+Login nodes are shared by everyone. To prevent impacting the responsiveness
+of the login nodes, please submit long and memory-heavy work as batch jobs,
+so that it runs on the dedicated compute nodes.""",
     "repeat_note": "This has happened {events} times within {days} days, so the cluster administrators have been copied on this message.",
 }
 
@@ -144,6 +145,18 @@ def load_config(path):
     if not cp.read(path):
         log.warning("config %s not found, using built-in defaults", path)
     return cp
+
+
+def unknown_settings(cp):
+    """Sections and settings in the config that the tool does not know, most
+    likely misspelled. They have no effect."""
+    out = []
+    for section in cp.sections():
+        if section not in DEFAULTS:
+            out.append("[%s]" % section)
+            continue
+        out += ["[%s] %s" % (section, k) for k in cp[section] if k not in DEFAULTS[section]]
+    return out
 
 
 def read_file(path):
@@ -769,7 +782,10 @@ def main():
     if args.cmd in ("reset", "testmail") and os.geteuid() != 0:
         sys.exit("frontendshepherd %s can only be run by root" % args.cmd)
     if args.cmd == "run":
-        Shepherd(load_config(args.config), dry_run=args.dry_run).run()
+        cp = load_config(args.config)
+        for name in unknown_settings(cp):
+            log.warning("unknown setting in %s, ignored: %s", args.config, name)
+        Shepherd(cp, dry_run=args.dry_run).run()
     elif args.cmd == "status":
         logging.disable(logging.WARNING)
         status(Shepherd(load_config(args.config)), args.user, args.all)

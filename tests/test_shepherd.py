@@ -146,7 +146,7 @@ class TestBucket(unittest.TestCase):
         self.assertEqual([m[2] for m in f.mails], [None, None])
         self.oom(f)
         self.assertEqual(f.mails[-1][2], f.s.admin)
-        self.assertIn("out of memory", f.mails[-1][1])
+        self.assertIn("were killed", f.mails[-1][1])
 
     def test_max_mails_per_day(self):
         f = Fake()
@@ -236,6 +236,16 @@ class TestConfig(unittest.TestCase):
         self.assertEqual((s.user_max_gb, s.reserved_gb), (16, 8))
         self.assertLessEqual(s.burst, 8)
 
+    def test_unknown_settings_are_found(self):
+        cp = fs.load_config("/nonexistent")
+        self.assertEqual(fs.unknown_settings(cp), [])
+        cp.read_string("[cpu]\nmin_cpu = 1\n[reaper]\nenabled = true\n")
+        self.assertEqual(fs.unknown_settings(cp), ["[cpu] min_cpu", "[reaper]"])
+
+    def test_shipped_config_has_no_unknown_settings(self):
+        conf = os.path.join(os.path.dirname(__file__), "..", "frontendshepherd.conf")
+        self.assertEqual(fs.unknown_settings(fs.load_config(conf)), [])
+
 
 class TestMailTexts(unittest.TestCase):
     def sent(self, f):
@@ -260,7 +270,7 @@ class TestMailTexts(unittest.TestCase):
     def test_broken_text_falls_back_to_the_default(self):
         f = Fake()
         f.s.messages["oom_body"] = "Hi {nosuchthing}"
-        self.assertIn("largest process was `python3`", self.sent(f)[1])
+        self.assertIn("The largest process was `python3`", self.sent(f)[1])
 
 
 class TestSmtp(unittest.TestCase):
