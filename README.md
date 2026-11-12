@@ -88,9 +88,9 @@ Any user can check their own allowance:
       Memory      3.1 of 16 GB
       Warnings    0 in the last 7 days
 
-`frontendshepherd status --all` lists everyone (the default for root), and `frontendshepherd status alice` shows one user.
+Users can only see their own status. As root, `frontendshepherd status` lists everyone and `frontendshepherd status alice` shows one user.
 
-Admins can fill a user's bucket and lift the throttle right away with `frontendshepherd reset alice`.
+Admins can fill a user's bucket and lift the throttle right away with `frontendshepherd reset alice`. Regular users can only run `frontendshepherd status`, the other commands (`run`, `reset` and `testmail`) are only available to root.
 
 Everything the daemon does is logged to the systemd journal: every throttle, release, reset, process killed for memory and stale process terminated, with user and time. View it with `journalctl -u frontendshepherd`.
 

@@ -89,6 +89,20 @@ class TestBucket(unittest.TestCase):
         self.assertEqual(st["level"], f.s.capacity)
         self.assertFalse(os.path.exists(os.path.join(f.tmp.name, "reset-" + UID)))
 
+    def test_each_user_gets_a_private_copy_of_their_own_record(self):
+        import json, stat
+        f = Fake()
+        f.run(1, 20)
+        own = os.path.join(f.tmp.name, "user-%s.json" % UID)
+        for path in (own, os.path.join(f.tmp.name, "state.json")):
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        with open(own) as fh:
+            self.assertEqual(json.load(fh), f.s.state["users"][UID])
+        # gone again when the user is forgotten
+        del f.s.state["users"][UID]
+        f.s.save_state()
+        self.assertFalse(os.path.exists(own))
+
     def test_bucket_arithmetic(self):
         for cores, hours in ((8, 1), (4, 2)):
             f = Fake()

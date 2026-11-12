@@ -286,12 +286,30 @@ class Shepherd:
             log.warning("ignoring unreadable state file: %s", e)
 
     def save_state(self):
-        tmp = self.state_file + ".tmp"
+        """Everything goes in state.json, which only root can read. Each user
+        also gets a copy of their own record that only they can read, for
+        `frontendshepherd status`."""
+        self.write_json(self.state_file, self.state)
+        keep = set()
+        for uid, st in self.state["users"].items():
+            path = os.path.join(self.state_dir, "user-%s.json" % uid)
+            keep.add(path)
+            self.write_json(path, st, owner=int(uid))
+        for path in glob.glob(os.path.join(self.state_dir, "user-*.json")):
+            if path not in keep:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+    def write_json(self, path, data, owner=None):
+        tmp = path + ".tmp"
         try:
-            with open(tmp, "w") as f:
-                json.dump(self.state, f)
-            os.chmod(tmp, 0o644)  # world readable so users can run `status`
-            os.replace(tmp, self.state_file)
+            with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+                json.dump(data, f)
+            if owner is not None and os.geteuid() == 0:
+                os.chown(tmp, owner, -1)
+            os.replace(tmp, path)
         except OSError as e:
             log.warning("cannot save state: %s", e)
 
@@ -704,17 +722,31 @@ def memory_gb(s, uid):
 
 
 def status(s, user=None, show_all=False):
-    s.load_state()
-    if not os.path.exists(s.state_file):
-        sys.exit("No state file at %s - is the daemon running?" % s.state_file)
-    if show_all or (user is None and os.geteuid() == 0):
-        status_all(s)
-        return
-    try:
-        uid = pwd.getpwnam(user).pw_uid if user else os.getuid()
-    except KeyError:
-        sys.exit("no such user: %s" % user)
-    st = s.state["users"].get(str(uid)) or s.new_user(0)
+    """Root sees everyone, a regular user only their own record."""
+    root = os.geteuid() == 0
+    if not root:
+        uid = os.getuid()
+        try:
+            with open(os.path.join(s.state_dir, "user-%d.json" % uid)) as f:
+                st = json.load(f)
+        except FileNotFoundError:
+            if not os.path.exists(s.state_file):
+                sys.exit("No state file at %s - is the daemon running?" % s.state_file)
+            st = s.new_user(0)  # not seen by the daemon yet
+        except (OSError, ValueError) as e:
+            sys.exit("cannot read your status: %s" % e)
+    else:
+        if not os.path.exists(s.state_file):
+            sys.exit("No state file at %s - is the daemon running?" % s.state_file)
+        s.load_state()
+        if show_all or user is None:
+            status_all(s)
+            return
+        try:
+            uid = pwd.getpwnam(user).pw_uid
+        except KeyError:
+            sys.exit("no such user: %s" % user)
+        st = s.state["users"].get(str(uid)) or s.new_user(0)
     hours = s.capacity / 3600
     level = min(s.capacity, st["level"])
     print("%s on %s%s" % (username(uid), s.host, "  [DRY RUN: nothing is enforced]" if s.dry_run else ""))
@@ -765,22 +797,22 @@ def status_all(s):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("-c", "--config", default=DEFAULT_CONFIG)
-    sub = ap.add_subparsers(dest="cmd")
-    run = sub.add_parser("run", help="run the daemon (as root)")
-    run.add_argument("--dry-run", action="store_true",
-                     help="log what would happen, limit nothing, send no mail")
-    st = sub.add_parser("status", help="show your own usage and limits")
-    st.add_argument("-a", "--all", action="store_true",
-                    help="show all users (the default for root)")
-    st.add_argument("user", nargs="?", help="show this user instead of yourself")
-    rs = sub.add_parser("reset", help="fill a user's bucket and lift the throttle (as root)")
-    rs.add_argument("user", nargs="+")
-    tm = sub.add_parser("testmail", help="send a test mail to check the [mail] settings (as root)")
-    tm.add_argument("address")
+    # regular users only get "status"; the other commands exist for root only
+    root = os.geteuid() == 0
+    sub = ap.add_subparsers(dest="cmd", metavar="{run,status,reset,testmail}" if root else "status")
+    st = sub.add_parser("status", help="show all users" if root else "show your own usage and limits")
+    if root:
+        st.add_argument("-a", "--all", action="store_true", help="show all users (the default)")
+        st.add_argument("user", nargs="?", help="show only this user")
+        run = sub.add_parser("run", help="run the daemon")
+        run.add_argument("--dry-run", action="store_true",
+                         help="log what would happen, limit nothing, send no mail")
+        rs = sub.add_parser("reset", help="fill a user's bucket and lift the throttle")
+        rs.add_argument("user", nargs="+")
+        tm = sub.add_parser("testmail", help="send a test mail to check the [mail] settings")
+        tm.add_argument("address")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    if args.cmd in ("reset", "testmail") and os.geteuid() != 0:
-        sys.exit("frontendshepherd %s can only be run by root" % args.cmd)
     if args.cmd == "run":
         cp = load_config(args.config)
         for name in unknown_settings(cp):
@@ -788,7 +820,7 @@ def main():
         Shepherd(cp, dry_run=args.dry_run).run()
     elif args.cmd == "status":
         logging.disable(logging.WARNING)
-        status(Shepherd(load_config(args.config)), args.user, args.all)
+        status(Shepherd(load_config(args.config)), getattr(args, "user", None), getattr(args, "all", False))
     elif args.cmd == "reset":
         s = Shepherd(load_config(args.config))
         for name in args.user:
