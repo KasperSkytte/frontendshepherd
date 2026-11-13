@@ -18,6 +18,10 @@ already gets (user.slice/user-UID.slice):
 A "CPU" here is a logical CPU as counted by nproc and top: one hardware
 thread. With hyper-threading, 2 CPUs are one physical core.
 
+3. Optional, off by default: a limit on what each user can store in /tmp
+   and /var/tmp, either with disk quotas or by making them ramdisks, where
+   files count towards the user's memory limit.
+
 Python 3.6+, standard library only. Needs cgroup v2 and systemd.
 """
 
@@ -43,6 +47,7 @@ from email.message import EmailMessage
 DEFAULT_CONFIG = "/etc/frontendshepherd.conf"
 SYSTEMD_DIR = "/etc/systemd/system"
 DROPIN = "90-frontendshepherd.conf"
+MOUNT_HEADER = "# Written by frontendshepherd from its config. Do not edit.\n"
 
 # Default mail texts. All can be replaced in the [mail] section of the config.
 MESSAGES = {
@@ -80,6 +85,7 @@ The largest process was `{process}`.
 Login nodes are shared by everyone. To prevent impacting the responsiveness
 of the login nodes, please submit long and memory-heavy work as batch jobs,
 so that it runs on the dedicated compute nodes.""",
+    "ramdisk_note": "Files in {tmp_paths} are kept in memory and count towards your memory limit, so your files there have been deleted.",
     "repeat_note": "This has happened {events} times within {days} days, so the cluster administrators have been copied on this message.",
 }
 
@@ -92,6 +98,7 @@ DEFAULTS = {
         "state_dir": "/var/lib/frontendshepherd",
         "cgroup_root": "/sys/fs/cgroup",
         "user_tasks_max": "8192",
+        "history_days": "365",
     },
     "cpu": {
         "min_cpus": "2",
@@ -120,6 +127,12 @@ DEFAULTS = {
         "repeat_days": "7",
         "cluster_name": "",
         **MESSAGES,
+    },
+    "tmp": {
+        "mode": "off",
+        "paths": "/tmp /var/tmp",
+        "quota_gb": "50",
+        "ramdisk_gb": "0",
     },
     "sheepdog": {
         "enabled": "true",
@@ -229,6 +242,9 @@ class Shepherd:
         self.dry_run = dry_run or g.getboolean("dry_run")
         self.state_dir = g.get("state_dir")
         self.state_file = os.path.join(self.state_dir, "state.json")
+        self.history_file = os.path.join(self.state_dir, "history.jsonl")
+        self.history_days = g.getfloat("history_days")
+        self.history_pruned = 0.0
         self.user_slice = os.path.join(g.get("cgroup_root"), "user.slice")
         self.tasks_max = g.getint("user_tasks_max")
 
@@ -271,6 +287,18 @@ class Shepherd:
         self.sheepdog_max_age = r.getfloat("max_age_days") * 86400
         self.sheepdog_interval = r.getfloat("interval_minutes") * 60
         self.sheepdog_last = 0.0
+        self.sheepdog_seen = set()  # pids already recorded in dry run
+
+        t = cp["tmp"]
+        self.tmp_mode = t.get("mode").strip().lower()
+        if self.tmp_mode not in ("off", "quota", "ramdisk"):
+            log.warning("[tmp] mode must be off, quota or ramdisk, not %r: using off", self.tmp_mode)
+            self.tmp_mode = "off"
+        self.tmp_paths = [os.path.normpath(p) for p in t.get("paths").split()]
+        self.quota_gb = t.getfloat("quota_gb")
+        self.ramdisk_gb = t.getfloat("ramdisk_gb")
+        self.quota_mounts = None  # filesystems to set quotas on, found on first use
+        self.quota_done = set()   # users who have their quota
 
         self.state = {"users": {}, "admin_mails": []}
         self.kmsg = None  # kernel log, opened in run()
@@ -314,6 +342,41 @@ class Shepherd:
             os.replace(tmp, path)
         except OSError as e:
             log.warning("cannot save state: %s", e)
+
+    # ---- history (for `frontendshepherd stats`) ---------------------------
+
+    def record(self, now, event, uid, detail=""):
+        """Append one event to the history file, which only root can read."""
+        entry = {"t": round(now), "event": event, "user": username(uid) if uid else "unknown"}
+        if detail:
+            entry["detail"] = detail
+        if self.dry_run:
+            entry["dry_run"] = True
+        try:
+            fd = os.open(self.history_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with open(fd, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError as e:
+            log.warning("cannot write the history: %s", e)
+
+    def prune_history(self, now):
+        """Once a day, drop events older than history_days."""
+        if now - self.history_pruned < 86400:
+            return
+        self.history_pruned = now
+        events = read_history(self.history_file)
+        keep = [e for e in events if now - e["t"] < self.history_days * 86400]
+        if len(keep) < len(events):
+            self.write_json_lines(self.history_file, keep)
+
+    def write_json_lines(self, path, entries):
+        tmp = path + ".tmp"
+        try:
+            with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+                f.writelines(json.dumps(e) + "\n" for e in entries)
+            os.replace(tmp, path)
+        except OSError as e:
+            log.warning("cannot write the history: %s", e)
 
     def new_user(self, now):
         return {"level": self.capacity, "throttled": False, "usage": None,
@@ -367,6 +430,148 @@ class Shepherd:
         if changed:
             log.info("static limits changed, reloading systemd")
             subprocess.run(["systemctl", "daemon-reload"], check=False)
+
+    # ---- /tmp: disk quotas ----------------------------------------------
+
+    def command(self, cmd, **kwargs):
+        """Run a command, return an error text or None if it went well."""
+        try:
+            r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                               universal_newlines=True, timeout=600, **kwargs)
+        except (OSError, subprocess.SubprocessError) as e:
+            return str(e)
+        return None if r.returncode == 0 else (r.stderr.strip() or "exit code %d" % r.returncode)
+
+    def apply_quota(self, uid):
+        """mode = quota: give a user their disk quota on the filesystems that
+        hold the tmp paths, the first time the daemon sees them."""
+        if uid in self.quota_done:
+            return
+        self.quota_done.add(uid)
+        if self.quota_mounts is None:
+            self.quota_mounts = set()
+            for path in self.tmp_paths:
+                if os.path.isdir(path):
+                    self.quota_mounts.add(mount_point(path))
+                else:
+                    log.warning("tmp path %s does not exist", path)
+        for mnt in sorted(self.quota_mounts):
+            if self.dry_run:
+                log.info("QUOTA %s: would get %.3g GB on %s [dry run]",
+                         username(uid), self.quota_gb, mnt)
+                continue
+            # no soft limit, hard limit in KiB, no limit on the number of files
+            err = self.command(["setquota", "-u", str(uid), "0",
+                                str(int(self.quota_gb * 2**20)), "0", "0", mnt])
+            if err:
+                log.warning("cannot set disk quotas on %s, giving up on it until restart: %s "
+                            "(are user quotas enabled on the filesystem, and is the "
+                            "`quota` package installed?)", mnt, err)
+                self.quota_mounts.discard(mnt)
+            else:
+                log.info("QUOTA %s: %.3g GB on %s", username(uid), self.quota_gb, mnt)
+
+    # ---- /tmp: ramdisks -------------------------------------------------
+
+    def mount_units(self):
+        """mode = ramdisk: return {unit name: content} of the systemd mount
+        units that put a ramdisk (tmpfs) on each tmp path."""
+        out = {}
+        if self.tmp_mode != "ramdisk":
+            return out
+        options = "mode=1777,strictatime,nosuid,nodev"
+        if self.ramdisk_gb > 0:
+            options += ",size=%dm" % (self.ramdisk_gb * 1024)
+        for path in self.tmp_paths:
+            name = subprocess.run(["systemd-escape", "--path", "--suffix=mount", path],
+                                  stdout=subprocess.PIPE, universal_newlines=True,
+                                  check=True).stdout.strip()
+            out[name] = MOUNT_HEADER + "\n".join([
+                "[Unit]",
+                "Description=Ramdisk on %s (frontendshepherd)" % path,
+                "ConditionPathIsSymbolicLink=!%s" % path,
+                "DefaultDependencies=no",
+                "Conflicts=umount.target",
+                "Before=local-fs.target umount.target",
+                "After=swap.target",
+                "",
+                "[Mount]",
+                "What=tmpfs",
+                "Where=%s" % path,
+                "Type=tmpfs",
+                "Options=%s" % options,
+                "",
+                "[Install]",
+                "WantedBy=local-fs.target",
+            ]) + "\n"
+        return out
+
+    def write_mount_units(self):
+        """Install the mount units, and remove ours that are no longer wanted.
+        Nothing is mounted or unmounted here: that would hide or lose files
+        that are in use. The change takes effect at the next boot."""
+        wanted = self.mount_units()
+        changed = False
+        for path in glob.glob(os.path.join(SYSTEMD_DIR, "*.mount")):
+            name = os.path.basename(path)
+            if name not in wanted and (read_file(path) or "").startswith(MOUNT_HEADER):
+                self.command(["systemctl", "disable", name])
+                os.remove(path)
+                changed = True
+                log.info("removed %s: no ramdisk there from the next boot", name)
+        for name, content in wanted.items():
+            path = os.path.join(SYSTEMD_DIR, name)
+            if read_file(path) != content:
+                with open(path, "w") as f:
+                    f.write(content)
+                changed = True
+        if changed:
+            subprocess.run(["systemctl", "daemon-reload"], check=False)
+        for name in wanted:
+            err = self.command(["systemctl", "enable", name])
+            if err:
+                log.warning("cannot enable %s: %s", name, err)
+        fstab = fstab_mount_points()
+        for path in self.tmp_paths if self.tmp_mode == "ramdisk" else ():
+            if path in fstab:
+                log.warning("%s has its own filesystem in /etc/fstab: from the next boot "
+                            "the ramdisk is mounted there instead, and that filesystem "
+                            "is no longer used", path)
+            if not is_tmpfs(path):
+                log.warning("%s is not a ramdisk yet: it will be from the next boot. "
+                            "Until then it is not limited", path)
+
+    def clean_ramdisks(self, uid):
+        """A killed user's files in a ramdisk still take up memory, and nobody
+        is charged for them once the user's slice is gone. Delete them, as the
+        user, so that nothing else can be touched."""
+        cleaned = []
+        for path in self.tmp_paths:
+            if not is_tmpfs(path):
+                continue
+            cleaned.append(path)
+            if self.dry_run:
+                log.info("CLEAN would delete the files of %s in %s [dry run]", username(uid), path)
+                continue
+            try:
+                pw = pwd.getpwuid(int(uid))
+            except KeyError:
+                continue
+
+            def become(pw=pw):
+                os.setgroups([])
+                os.setgid(pw.pw_gid)
+                os.setuid(pw.pw_uid)
+            err = self.command(["find", path, "-xdev", "-mindepth", "1", "-user",
+                                str(pw.pw_uid), "-delete"], preexec_fn=become, cwd="/")
+            # directories of others that the user can not enter are expected
+            err = "\n".join(l for l in (err or "").splitlines() if "Permission denied" not in l)
+            if err:
+                log.warning("CLEAN could not delete all files of %s in %s: %s",
+                            pw.pw_name, path, err[:300])
+            else:
+                log.info("CLEAN deleted the files of %s in %s", pw.pw_name, path)
+        return cleaned
 
     # ---- CPU quota ------------------------------------------------------
 
@@ -430,7 +635,7 @@ class Shepherd:
         sent.append(now)
         return True
 
-    def notify_user(self, uid, kind, st, now, process=""):
+    def notify_user(self, uid, kind, st, now, process="", cleaned=()):
         if not self.may_mail(st.setdefault("mails", []), now):
             log.warning("no mail to %s: already %d mails in the last 24 hours",
                         username(uid), self.max_mails)
@@ -447,9 +652,11 @@ class Shepherd:
             "events": len(st["events"]), "days": "%.3g" % (self.repeat_window / 86400),
             "processes": (top_processes(os.path.join(self.user_slice, "user-%s.slice" % uid))
                           if kind == "throttle" else ""),
-            "process": process,
+            "process": process, "tmp_paths": " and ".join(cleaned),
         }
         body = self.render(kind + "_body", values) + "\n"
+        if cleaned:
+            body += "\n" + self.render("ramdisk_note", values) + "\n"
         if repeat:
             body += "\n" + self.render("repeat_note", values) + "\n"
         self.send(self.address.format(user=user), self.render(kind + "_subject", values),
@@ -479,6 +686,7 @@ class Shepherd:
             if st:
                 st["level"], st["throttled"] = self.capacity, False
             log.info("RESET %s (uid %s): CPU budget restored by an admin", username(uid), uid)
+            self.record(time.time(), "reset", uid)
 
     def tick(self, now=None):
         now = now or time.time()
@@ -519,6 +727,7 @@ class Shepherd:
                 log.info("THROTTLE %s (uid %s): CPU budget used up, limiting to %.3g CPUs "
                          "(%d events in window)%s", name, uid, self.min_cpus,
                          len(st["events"]), " [dry run]" if self.dry_run else "")
+                self.record(now, "throttle", uid)
                 self.notify_user(uid, "throttle", st, now)
             elif event == "release":
                 log.info("RELEASE %s (uid %s): the whole CPU budget is available again", name, uid)
@@ -527,10 +736,13 @@ class Shepherd:
                 self.ensure_quota(uid, path,
                                   self.min_cpus if st["throttled"] else self.burst)
                 self.ensure_group_kill(path)
+                if self.tmp_mode == "quota":
+                    self.apply_quota(uid)
             elif st["level"] >= self.capacity and not st["events"]:
                 del users[uid]  # logged out, nothing used, clean record: forget
 
         self.check_oom(now)
+        self.prune_history(now)
         if self.sheepdog_enabled and now - self.sheepdog_last >= self.sheepdog_interval:
             self.sheepdog_last = now
             self.sheepdog(now)
@@ -604,10 +816,12 @@ class Shepherd:
             else:
                 log.info("OOM %s (uid %s): over the memory limit, all processes killed "
                          "(largest: %s)", name, uid, process)
+            self.record(now, "total_memory" if total else "memory", uid, process)
             if uid and not self.exempt(int(uid)):
                 st = self.state["users"].setdefault(uid, self.new_user(now))
                 st["events"].append(now)
-                self.notify_user(uid, "oom", st, now, process)
+                cleaned = self.clean_ramdisks(uid) if self.tmp_mode == "ramdisk" else []
+                self.notify_user(uid, "oom", st, now, process, cleaned)
 
     def sheepdog(self, now):
         """SIGTERM old processes whose command line matches a sheepdog pattern."""
@@ -636,16 +850,24 @@ class Shepherd:
                     continue
                 log.info("SHEEPDOG terminated pid %d of %s, %.0f days old: %s%s", pid, username(uid),
                          age / 86400, cmd[:120], " [dry run]" if self.dry_run else "")
+                # in dry run the process lives on: count it only once
+                if pid not in self.sheepdog_seen:
+                    self.record(now, "sheepdog", uid, cmd[:120])
+                if self.dry_run:
+                    self.sheepdog_seen.add(pid)
                 if not self.dry_run:
                     os.kill(pid, signal.SIGTERM)
             except (OSError, AttributeError, IndexError, ValueError):
                 continue  # process went away while we looked at it
 
     def policy(self):
+        tmp = {"off": "",
+               "quota": ", %.3g GB disk quota per user for %s" % (self.quota_gb, " ".join(self.tmp_paths)),
+               "ramdisk": ", %s in memory" % " ".join(self.tmp_paths)}[self.tmp_mode]
         return ("%.3g CPUs always free, burst up to %.3g CPUs, budget of %.3g "
-                "CPU-hours restored in %.3g hours, %.3g GB memory per user"
+                "CPU-hours restored in %.3g hours, %.3g GB memory per user%s"
                 % (self.min_cpus, self.burst, self.capacity / 3600,
-                   self.refill_hours, self.user_max_gb))
+                   self.refill_hours, self.user_max_gb, tmp))
 
     def run(self):
         if read_file(os.path.join(os.path.dirname(self.user_slice), "cgroup.controllers")) is None:
@@ -655,6 +877,7 @@ class Shepherd:
             log.info("DRY RUN: nothing is limited, no mail is sent, only logging")
         else:
             self.write_dropins()
+            self.write_mount_units()
         self.open_kmsg()
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: self.stop.set())
@@ -681,6 +904,34 @@ def meminfo_total_kb():
         if line.startswith("MemTotal:"):
             return int(line.split()[1])
     return 0
+
+
+def mount_point(path):
+    """The mount point of the filesystem that holds `path`."""
+    path = os.path.realpath(path)
+    while not os.path.ismount(path):
+        path = os.path.dirname(path)
+    return path
+
+
+def fstab_mount_points(fstab="/etc/fstab"):
+    """The mount points listed in /etc/fstab."""
+    out = set()
+    for line in (read_file(fstab) or "").splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and not fields[0].startswith("#"):
+            out.add(os.path.normpath(fields[1].replace("\\040", " ")))
+    return out
+
+
+def is_tmpfs(path, mounts="/proc/self/mounts"):
+    """True if a ramdisk (tmpfs) is mounted on exactly `path`."""
+    fstype = None
+    for line in (read_file(mounts) or "").splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[1].replace("\\040", " ") == path:
+            fstype = fields[2]  # the last mount on a path is the visible one
+    return fstype == "tmpfs"
 
 
 def slice_pids(path):
@@ -797,12 +1048,60 @@ def status_all(s):
         print("(no users logged in)")
 
 
+EVENTS = [("throttle", "CPU throttled"), ("memory", "killed, user memory limit"),
+          ("total_memory", "killed, total memory limit"), ("sheepdog", "stale process stopped"),
+          ("reset", "reset by an admin")]
+
+
+def read_history(path):
+    events = []
+    for line in (read_file(path) or "").splitlines():
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            pass
+    return events
+
+
+def stats(s, days):
+    """Root only: how often the limits were hit, in total, per week and per user."""
+    now = time.time()
+    events = [e for e in read_history(s.history_file) if now - e["t"] < days * 86400]
+    since = time.strftime("%Y-%m-%d", time.localtime(now - days * 86400))
+    print("Events on %s in the last %g days (since %s)" % (s.host, days, since))
+    if not events:
+        print("\n(none)")
+        return
+    if any(e.get("dry_run") for e in events):
+        print("Some happened in dry run, so they were only logged, not enforced.")
+    kinds = [k for k, _ in EVENTS]
+
+    print("\n%-28s %6s %6s" % ("", "TIMES", "USERS"))
+    for kind, label in EVENTS:
+        of_kind = [e for e in events if e["event"] == kind]
+        print("%-28s %6d %6d" % (label, len(of_kind), len({e["user"] for e in of_kind})))
+
+    def table(title, key, rows):
+        print("\n%-16s %9s %7s %7s %9s %6s" % (title, "THROTTLED", "MEMORY", "TOTAL", "SHEEPDOG", "RESET"))
+        for name in rows:
+            n = [sum(1 for e in events if key(e) == name and e["event"] == k) for k in kinds]
+            print("%-16s %9d %7d %7d %9d %6d" % ((name[:16],) + tuple(n)))
+
+    week = lambda e: time.strftime("%G-W%V", time.localtime(e["t"]))
+    table("WEEK", week, sorted({week(e) for e in events}))
+    users = {}
+    for e in events:
+        users[e["user"]] = users.get(e["user"], 0) + 1
+    top = sorted(users, key=lambda u: -users[u])[:10]
+    table("USER (top 10)", lambda e: e["user"], top)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("-c", "--config", default=DEFAULT_CONFIG)
     # regular users only get "status"; the other commands exist for root only
     root = os.geteuid() == 0
-    sub = ap.add_subparsers(dest="cmd", metavar="{run,status,reset,testmail}" if root else "status")
+    sub = ap.add_subparsers(dest="cmd", metavar="{run,status,stats,reset,testmail}" if root else "status")
     st = sub.add_parser("status", help="show all users" if root else "show your own usage and limits")
     if root:
         st.add_argument("-a", "--all", action="store_true", help="show all users (the default)")
@@ -810,6 +1109,8 @@ def main():
         run = sub.add_parser("run", help="run the daemon")
         run.add_argument("--dry-run", action="store_true",
                          help="log what would happen, limit nothing, send no mail")
+        sa = sub.add_parser("stats", help="how often the limits were hit, per week and per user")
+        sa.add_argument("--days", type=float, default=90, help="how far back, default 90 days")
         rs = sub.add_parser("reset", help="give a user their whole CPU budget back and lift the throttle")
         rs.add_argument("user", nargs="+")
         tm = sub.add_parser("testmail", help="send a test mail to check the [mail] settings")
@@ -824,6 +1125,8 @@ def main():
     elif args.cmd == "status":
         logging.disable(logging.WARNING)
         status(Shepherd(load_config(args.config)), getattr(args, "user", None), getattr(args, "all", False))
+    elif args.cmd == "stats":
+        stats(Shepherd(load_config(args.config)), args.days)
     elif args.cmd == "reset":
         s = Shepherd(load_config(args.config))
         for name in args.user:

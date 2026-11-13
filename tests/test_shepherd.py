@@ -5,6 +5,7 @@
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -241,6 +242,114 @@ class TestSliceOnly(unittest.TestCase):
         out = fs.top_processes(self.f.slice)
         self.assertIn(str(self.inside.pid), out)
         self.assertNotIn(str(self.outside.pid), out)
+
+
+class TestTmp(unittest.TestCase):
+    def fake(self, mode):
+        f = Fake()
+        f.cp["tmp"].update(mode=mode, paths="/tmp /var/tmp", quota_gb="50", ramdisk_gb="32")
+        f.s = fs.Shepherd(f.cp)
+        f.s.send = lambda to, subject, body, cc=None: f.mails.append((to, subject, body))
+        f.commands = []
+        f.s.command = lambda cmd, **kw: f.commands.append(cmd)
+        return f
+
+    def test_off_by_default(self):
+        f = Fake()
+        self.assertEqual(f.s.tmp_mode, "off")
+        self.assertEqual(f.s.mount_units(), {})
+
+    def test_quota_is_set_once_per_user_and_filesystem(self):
+        f = self.fake("quota")
+        f.s.quota_mounts = {"/tmp"}
+        f.s.apply_quota(UID)
+        f.s.apply_quota(UID)
+        self.assertEqual(f.commands, [["setquota", "-u", UID, "0", str(50 * 2**20), "0", "0", "/tmp"]])
+
+    def test_quota_gives_up_on_a_filesystem_without_quotas(self):
+        f = self.fake("quota")
+        f.s.quota_mounts = {"/tmp"}
+        f.s.command = lambda cmd, **kw: "quotas not enabled"
+        f.s.apply_quota(UID)
+        self.assertEqual(f.s.quota_mounts, set())
+
+    def test_ramdisk_mount_units(self):
+        units = self.fake("ramdisk").s.mount_units()
+        self.assertEqual(sorted(units), ["tmp.mount", "var-tmp.mount"])
+        self.assertIn("Where=/var/tmp\n", units["var-tmp.mount"])
+        self.assertIn("Options=mode=1777,strictatime,nosuid,nodev,size=32768m\n", units["tmp.mount"])
+
+    def test_is_tmpfs_looks_at_the_last_mount_on_the_path(self):
+        mounts = os.path.join(tempfile.mkdtemp(), "mounts")
+        with open(mounts, "w") as fh:
+            fh.write("/dev/vg/tmp /tmp ext4 rw 0 0\ntmpfs /dev/shm tmpfs rw 0 0\n")
+        self.assertFalse(fs.is_tmpfs("/tmp", mounts))
+        self.assertTrue(fs.is_tmpfs("/dev/shm", mounts))
+        with open(mounts, "a") as fh:
+            fh.write("tmpfs /tmp tmpfs rw 0 0\n")
+        self.assertTrue(fs.is_tmpfs("/tmp", mounts))
+
+    def test_fstab_mount_points(self):
+        fstab = os.path.join(tempfile.mkdtemp(), "fstab")
+        with open(fstab, "w") as fh:
+            fh.write("# /dev/sda1 /old ext4\n/dev/system/root / ext4 defaults 0 1\n"
+                     "/dev/system/tmp /tmp/ xfs defaults 0 2\n")
+        self.assertEqual(fs.fstab_mount_points(fstab), {"/", "/tmp"})
+
+    def test_permission_denied_in_others_directories_is_not_an_error(self):
+        f = self.fake("ramdisk")
+        f.s.command = lambda cmd, **kw: "find: '/tmp/systemd-private-x': Permission denied"
+        real, fs.is_tmpfs = fs.is_tmpfs, lambda path: path == "/tmp"
+        try:
+            with self.assertNoLogs("frontendshepherd", "WARNING"):
+                f.s.clean_ramdisks(str(os.getuid()))
+        finally:
+            fs.is_tmpfs = real
+
+    def test_killed_users_files_in_ramdisks_are_deleted(self):
+        f = self.fake("ramdisk")
+        uid = str(os.getuid())
+        os.makedirs(os.path.join(f.s.user_slice, "user-%s.slice" % uid))
+        f.s.oom_events = lambda: [("/user.slice/user-%s.slice" % uid, "/x", "python3")]
+        real, fs.is_tmpfs = fs.is_tmpfs, lambda path: path == "/tmp"
+        try:
+            f.s.check_oom(f.now)
+        finally:
+            fs.is_tmpfs = real
+        self.assertEqual(f.commands, [["find", "/tmp", "-xdev", "-mindepth", "1", "-user", uid, "-delete"]])
+        self.assertIn("Files in /tmp are kept in memory", f.mails[-1][2])
+
+
+class TestHistory(unittest.TestCase):
+    def test_throttle_and_kill_are_recorded(self):
+        f = Fake()
+        f.run(16, 3 * 3600)
+        f.s.oom_events = lambda: [("/user.slice/user-%s.slice" % UID, "/x", "python3")]
+        f.s.check_oom(f.now)
+        events = fs.read_history(f.s.history_file)
+        self.assertEqual([e["event"] for e in events], ["throttle", "memory"])
+        self.assertEqual(events[1]["detail"], "python3")
+        self.assertTrue(events[0]["dry_run"])
+
+    def test_old_events_are_pruned(self):
+        f = Fake()
+        f.s.record(f.now - 400 * 86400, "throttle", UID)
+        f.s.record(f.now, "memory", UID)
+        f.s.prune_history(f.now)
+        self.assertEqual([e["event"] for e in fs.read_history(f.s.history_file)], ["memory"])
+
+    def test_stats(self):
+        import contextlib, io
+        f = Fake()
+        now = time.time()
+        for event in ("throttle", "throttle", "memory", "sheepdog"):
+            f.s.record(now - 3600, event, UID)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            fs.stats(f.s, 30)
+        out = out.getvalue()
+        self.assertRegex(out, r"CPU throttled +2 +1")
+        self.assertRegex(out, r"%s +2 +1 +0 +1 +0" % UID)
 
 
 class TestConfig(unittest.TestCase):
