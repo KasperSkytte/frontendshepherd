@@ -27,6 +27,8 @@ Python 3.6+, standard library only. Needs cgroup v2 and systemd.
 
 import argparse
 import configparser
+import ctypes
+import ctypes.util
 import errno
 import glob
 import json
@@ -299,6 +301,7 @@ class Shepherd:
         self.ramdisk_gb = t.getfloat("ramdisk_gb")
         self.quota_mounts = None  # filesystems to set quotas on, found on first use
         self.quota_done = set()   # users who have their quota
+        self.disk_last = 0.0      # last check for full disks
 
         self.state = {"users": {}, "admin_mails": []}
         self.kmsg = None  # kernel log, opened in run()
@@ -346,8 +349,9 @@ class Shepherd:
     # ---- history (for `frontendshepherd stats`) ---------------------------
 
     def record(self, now, event, uid, detail=""):
-        """Append one event to the history file, which only root can read."""
-        entry = {"t": round(now), "event": event, "user": username(uid) if uid else "unknown"}
+        """Append one event to the history file, which only root can read.
+        uid None: an event that concerns everyone, such as a full disk."""
+        entry = {"t": round(now), "event": event, "user": username(uid) if uid else "-"}
         if detail:
             entry["detail"] = detail
         if self.dry_run:
@@ -470,6 +474,41 @@ class Shepherd:
                 self.quota_mounts.discard(mnt)
             else:
                 log.info("QUOTA %s: %.3g GB on %s", username(uid), self.quota_gb, mnt)
+
+    def check_disks(self, now):
+        """Once a minute: record when a filesystem of the tmp paths runs
+        full, and with mode = quota when a user reaches their quota. Both are
+        recorded once, when they happen, not for as long as they last."""
+        full = self.state.setdefault("full_disks", [])
+        mounts = sorted({mount_point(p) for p in self.tmp_paths if os.path.isdir(p)})
+        for mnt in mounts:
+            try:
+                v = os.statvfs(mnt)
+            except OSError:
+                continue
+            free = v.f_bavail / v.f_blocks if v.f_blocks else 1.0  # space users can still use
+            if free < 0.01 and mnt not in full:
+                full.append(mnt)
+                log.warning("DISK FULL %s: less than 1%% left for users", mnt)
+                self.record(now, "disk_full", None, mnt)
+            elif free > 0.05 and mnt in full:
+                full.remove(mnt)
+        if self.tmp_mode != "quota":
+            return
+        for uid, st in self.state["users"].items():
+            at_limit = st.setdefault("disk_quota", [])
+            for mnt in mounts:
+                q = get_quota(mnt, int(uid))
+                if q is None or not q[1]:
+                    continue  # no quotas on this filesystem, or no limit for the user
+                used, limit = q
+                if used >= 0.99 * limit and mnt not in at_limit:
+                    at_limit.append(mnt)
+                    log.info("DISK QUOTA %s (uid %s): reached %.3g GB on %s", username(uid),
+                             uid, limit / 2**30, mnt)
+                    self.record(now, "disk_quota", uid, mnt)
+                elif used < 0.95 * limit and mnt in at_limit:
+                    at_limit.remove(mnt)
 
     # ---- /tmp: ramdisks -------------------------------------------------
 
@@ -742,6 +781,9 @@ class Shepherd:
                 del users[uid]  # logged out, nothing used, clean record: forget
 
         self.check_oom(now)
+        if now - self.disk_last >= 60:
+            self.disk_last = now
+            self.check_disks(now)
         self.prune_history(now)
         if self.sheepdog_enabled and now - self.sheepdog_last >= self.sheepdog_interval:
             self.sheepdog_last = now
@@ -914,6 +956,40 @@ def mount_point(path):
     return path
 
 
+def mount_source(path, mounts="/proc/self/mounts"):
+    """The device mounted on `path`."""
+    source = None
+    for line in (read_file(mounts) or "").splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[1].replace("\\040", " ") == path:
+            source = fields[0]
+    return source
+
+
+class _Dqblk(ctypes.Structure):
+    """struct if_dqblk of the quotactl system call."""
+    _fields_ = [(n, ctypes.c_uint64) for n in (
+        "bhardlimit", "bsoftlimit", "curspace", "ihardlimit", "isoftlimit",
+        "curinodes", "btime", "itime")] + [("valid", ctypes.c_uint32)]
+
+
+def get_quota(mnt, uid):
+    """(bytes used, hard limit in bytes) of a user on a filesystem, or None if
+    it has no user quotas. Limit 0 means no limit."""
+    source = mount_source(mnt)
+    if not source:
+        return None
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    except OSError:
+        return None
+    q = _Dqblk()
+    Q_GETQUOTA, USRQUOTA = 0x800007, 0
+    if libc.quotactl((Q_GETQUOTA << 8) | USRQUOTA, source.encode(), uid, ctypes.byref(q)) != 0:
+        return None
+    return q.curspace, q.bhardlimit * 1024  # limits are in blocks of 1 KiB
+
+
 def fstab_mount_points(fstab="/etc/fstab"):
     """The mount points listed in /etc/fstab."""
     out = set()
@@ -1049,7 +1125,8 @@ def status_all(s):
 
 
 EVENTS = [("throttle", "CPU throttled"), ("memory", "killed, user memory limit"),
-          ("total_memory", "killed, total memory limit"), ("sheepdog", "stale process stopped"),
+          ("total_memory", "killed, total memory limit"), ("disk_quota", "reached the disk quota"),
+          ("disk_full", "temp filesystem full"), ("sheepdog", "stale process stopped"),
           ("reset", "reset by an admin")]
 
 
@@ -1079,21 +1156,27 @@ def stats(s, days):
     print("\n%-28s %6s %6s" % ("", "TIMES", "USERS"))
     for kind, label in EVENTS:
         of_kind = [e for e in events if e["event"] == kind]
-        print("%-28s %6d %6d" % (label, len(of_kind), len({e["user"] for e in of_kind})))
+        users = len({e["user"] for e in of_kind}) if kind != "disk_full" else "-"
+        print("%-28s %6d %6s" % (label, len(of_kind), users))
 
-    def table(title, key, rows):
-        print("\n%-16s %9s %7s %7s %9s %6s" % (title, "THROTTLED", "MEMORY", "TOTAL", "SHEEPDOG", "RESET"))
+    heads = ["THROTTLED", "MEMORY", "TOTAL", "QUOTA", "DISKFULL", "SHEEPDOG", "RESET"]
+
+    def table(title, key, rows, kinds=kinds, heads=heads):
+        print("\n%-16s" % title + "".join("  %*s" % (len(h), h) for h in heads))
         for name in rows:
             n = [sum(1 for e in events if key(e) == name and e["event"] == k) for k in kinds]
-            print("%-16s %9d %7d %7d %9d %6d" % ((name[:16],) + tuple(n)))
+            print("%-16s" % name[:16] + "".join("  %*d" % (len(h), x) for h, x in zip(heads, n)))
 
     week = lambda e: time.strftime("%G-W%V", time.localtime(e["t"]))
     table("WEEK", week, sorted({week(e) for e in events}))
     users = {}
     for e in events:
-        users[e["user"]] = users.get(e["user"], 0) + 1
+        if e["event"] != "disk_full":  # concerns everyone, not one user
+            users[e["user"]] = users.get(e["user"], 0) + 1
     top = sorted(users, key=lambda u: -users[u])[:10]
-    table("USER (top 10)", lambda e: e["user"], top)
+    i = kinds.index("disk_full")
+    table("USER (top 10)", lambda e: e["user"], top,
+          kinds[:i] + kinds[i + 1:], heads[:i] + heads[i + 1:])
 
 
 def main():

@@ -349,7 +349,30 @@ class TestHistory(unittest.TestCase):
             fs.stats(f.s, 30)
         out = out.getvalue()
         self.assertRegex(out, r"CPU throttled +2 +1")
-        self.assertRegex(out, r"%s +2 +1 +0 +1 +0" % UID)
+        self.assertRegex(out, r"%s +2 +1 +0 +0 +1 +0\n" % UID)
+
+    def test_full_disk_and_quota_are_recorded_once(self):
+        f = Fake()
+        f.s.tmp_mode, f.s.tmp_paths = "quota", [f.tmp.name]
+        f.s.state["users"][UID] = f.s.new_user(f.now)
+        free, used = [50], [10 * 2**30]
+        stat = lambda mnt: os.statvfs_result((4096, 4096, 1000, free[0], free[0], 0, 0, 0, 0, 255))
+        real = fs.os.statvfs, fs.get_quota
+        fs.os.statvfs = stat
+        fs.get_quota = lambda mnt, uid: (used[0], 50 * 2**30)
+        try:
+            f.s.check_disks(f.now)              # 5 % free, 10 of 50 GB
+            free[0], used[0] = 5, 50 * 2**30    # 0.5 % free, quota reached
+            f.s.check_disks(f.now)
+            f.s.check_disks(f.now)              # still so: not recorded again
+            free[0], used[0] = 100, 1 * 2**30
+            f.s.check_disks(f.now)
+            free[0], used[0] = 5, 50 * 2**30    # and again
+            f.s.check_disks(f.now)
+        finally:
+            fs.os.statvfs, fs.get_quota = real
+        events = [(e["event"], e["user"]) for e in fs.read_history(f.s.history_file)]
+        self.assertEqual(events, [("disk_full", "-"), ("disk_quota", UID)] * 2)
 
 
 class TestConfig(unittest.TestCase):

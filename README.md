@@ -115,7 +115,7 @@ Admins can give a user their whole budget back and lift the throttle right away 
 
 Everything the daemon does is logged to the systemd journal: every throttle, release, reset, process killed for memory and stale process terminated, with user and time. View it with `journalctl -u frontendshepherd`.
 
-For an overview over time, `frontendshepherd stats` (root only) shows how many times users were throttled, killed for memory and had stale processes stopped, in total, per week and for the users with the most events. By default for the last 90 days, use `--days` to change it. The events are kept for a year (`history_days`) in `/var/lib/frontendshepherd/history.jsonl`, one JSON line per event, and each node keeps its own:
+For an overview over time, `frontendshepherd stats` (root only) shows how many times users were throttled, killed for memory, reached their disk quota and had stale processes stopped, and how often a filesystem of `/tmp` or `/var/tmp` ran full (less than 1% left), in total, per week and for the users with the most events. By default for the last 90 days, use `--days` to change it. Full filesystems are recorded in every `[tmp]` mode, also `off`, and disk quotas only with `quota`. The events are kept for a year (`history_days`) in `/var/lib/frontendshepherd/history.jsonl`, one JSON line per event, and each node keeps its own:
 
     $ sudo frontendshepherd stats --days 30
     Events on bio-fe01 in the last 30 days (since 2026-10-14)
@@ -124,15 +124,17 @@ For an overview over time, `frontendshepherd stats` (root only) shows how many t
     CPU throttled                    22      9
     killed, user memory limit         2      2
     killed, total memory limit        0      0
+    reached the disk quota            3      2
+    temp filesystem full              0      -
     stale process stopped             9      3
     reset by an admin                 1      1
 
-    WEEK             THROTTLED  MEMORY   TOTAL  SHEEPDOG  RESET
-    2026-W42                 1       1       0         2      0
+    WEEK              THROTTLED  MEMORY  TOTAL  QUOTA  DISKFULL  SHEEPDOG  RESET
+    2026-W42                  1       1      0      1         0         2      0
     ...
 
-    USER (top 10)    THROTTLED  MEMORY   TOTAL  SHEEPDOG  RESET
-    alice                   13       0       0         4      1
+    USER (top 10)     THROTTLED  MEMORY  TOTAL  QUOTA  SHEEPDOG  RESET
+    alice                    13       0      0      2         4      1
     ...
 
 ## How it works
