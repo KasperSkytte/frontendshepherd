@@ -112,6 +112,51 @@ There is no limit on the number of users logged in at once. Nothing is reserved 
 - Stopping the daemon lifts all throttles; the memory limits and CPU ceiling stay. CPU budgets survive restarts and reboots.
 - Uninstall: disable the service, then `rm /etc/systemd/system/user*.slice.d/90-frontendshepherd.conf` and `systemctl daemon-reload`.
 
-## Test
+## Testing whether it works as intended
+
+Unit tests, no root needed:
 
     python3 tests/test_shepherd.py
+
+### On a live node
+Log in over SSH as a regular user that is not exempt (`sudo` and `su` sessions do not count as a login of that user). Only test this with `dry_run = false`. In dry run nothing is limited, so the memory test would just use up the node's memory. First check that the limits are in place:
+
+```
+cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/memory.max   # user_max_gb in bytes, not "max"
+cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/cpu.max      # max_cpus x 100000, e.g. "800000 100000"
+```
+
+**CPU.** With the defaults it takes 1 hour at 8 CPUs to use up the budget. To test faster, set `budget_cpu_hours = 0.1` and `refill_hours = 0.1` and restart the service, then the user is throttled after about 45 seconds and released 6 minutes after the load has stopped. Remember to set them back afterwards.
+
+```
+# start more busy processes than max_cpus, they stop by themselves after 2 hours
+for i in $(seq 16); do timeout 2h sh -c 'while :; do :; done' & done
+
+top -u $USER                 # together they never use more than max_cpus x 100 %
+frontendshepherd status      # the CPU budget being used, then THROTTLED
+
+# when throttled, the ceiling is min_cpus, e.g. "200000 100000", and a mail is sent
+cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/cpu.max
+
+# stop the load and watch the budget recover until the throttle is lifted
+pkill -u $USER timeout
+```
+
+As root, `frontendshepherd reset USER` gives the user their whole budget back right away.
+
+**Memory.** This kills all of the user's processes on the node and logs the user out, so run it in an extra SSH session and not in one you need:
+
+```
+# uses 1 GB more every second until the kernel kills it at user_max_gb
+python3 -c '
+import time
+a = []
+while True:
+    a.append(b"x" * 2**30)
+    print(len(a), "GB", flush=True)
+    time.sleep(1)'
+```
+
+The user's other sessions are closed too and a mail is sent. Logging in again works right away. As root, see what happened with `journalctl -u frontendshepherd` and `journalctl -k | grep oom-kill`.
+
+The limit for all users together is harder to reach, as it needs several users at once. To test it, temporarily set `reserved_gb` so that all users together get less than `user_max_gb` (e.g. `reserved_gb = 244` on a 256GB node leaves 12GB for all users) and restart. The memory test above then hits the total limit first, and the admin gets a mail too. Every logged-in user shares that limit while it is set, so do this when the node is not in use.
