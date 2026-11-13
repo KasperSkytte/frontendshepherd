@@ -48,13 +48,13 @@ Off by default. The settings are in the `[tmp]` section of the config file.
 | `quota_gb` | `50` | With `quota`: max disk space per user on each filesystem that holds one of the paths. |
 | `ramdisk_gb` | `0` | With `ramdisk`: size of each ramdisk for all users together. `0` is half of the node's memory. |
 
-With `quota`, the `quota` package (`setquota`) must be installed and user quotas must already be enabled on the filesystems that hold the paths, `frontendshepherd` does not do that. The limit applies to everything the user has on that filesystem, so it is simplest when the paths have their own filesystem. A quota on the root filesystem is also fine when home directories are elsewhere, since users can then only write to `/var/tmp` there anyway. A user gets the quota the first time they are seen on the node. Enabling user quotas, once per filesystem:
+With `quota`, the `quota` package (`setquota`) must be installed and user quotas must be enabled on the filesystems. A user gets the quota the first time they access the node. Enabling user quotas, once per filesystem:
 
 - ext4: add `usrquota` to the mount options in `/etc/fstab`, then `mount -o remount /tmp`, `quotacheck -cum /tmp` and `quotaon -u /tmp`.
 - XFS: add `uquota` to the mount options in `/etc/fstab`, then unmount and mount it again (a remount is not enough). For the root filesystem add `rootflags=uquota` to the kernel command line and reboot instead.
 - Check with `quotaon -pu /tmp`, and see everyone's usage with `repquota -s /tmp`. Users can see their own with `quota -s`.
 
-With `ramdisk`, the paths only become ramdisks at the next reboot, nothing is mounted on a running node. Everything in them is lost at every reboot, also in `/var/tmp`. If a path has its own filesystem in `/etc/fstab`, the ramdisk is mounted there instead and that filesystem is no longer used.
+With `ramdisk`, the paths only become ramdisks at the next reboot, nothing is mounted on a running node. Everything in them is lost at every reboot, also in `/var/tmp`. If a path is already present in `/etc/fstab`, the ramdisk is mounted there instead and that filesystem is no longer used.
 
 ### Stale or long-running processes
 These are handled by the "sheepdog", and its settings are in the `[sheepdog]` section of the config file.
