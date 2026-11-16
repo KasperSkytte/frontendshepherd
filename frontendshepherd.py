@@ -447,8 +447,8 @@ class Shepherd:
         return None if r.returncode == 0 else (r.stderr.strip() or "exit code %d" % r.returncode)
 
     def apply_quota(self, uid):
-        """mode = quota: give a user their disk quota on the filesystems that
-        hold the tmp paths, the first time the daemon sees them."""
+        """mode = quota: give a user their disk quota on the filesystems of
+        the tmp paths, the first time the daemon sees them."""
         if uid in self.quota_done:
             return
         self.quota_done.add(uid)
@@ -469,8 +469,10 @@ class Shepherd:
                                 str(int(self.quota_gb * 2**20)), "0", "0", mnt])
             if err:
                 log.warning("cannot set disk quotas on %s, giving up on it until restart: %s "
-                            "(are user quotas enabled on the filesystem, and is the "
-                            "`quota` package installed?)", mnt, err)
+                            "(user quotas must be on: add usrquota to its options in "
+                            "/etc/fstab, then run `mount -o remount %s && quotacheck -cum %s "
+                            "&& quotaon -u %s` and restart frontendshepherd)",
+                            mnt, " ".join(err.split()), mnt, mnt, mnt)
                 self.quota_mounts.discard(mnt)
             else:
                 log.info("QUOTA %s: %.3g GB on %s", username(uid), self.quota_gb, mnt)

@@ -45,14 +45,15 @@ Off by default. The settings are in the `[tmp]` section of the config file.
 |---|---|---|
 | `mode` | `off` | `quota`: a disk quota per user. A user at the limit gets "Disk quota exceeded", nothing is killed. `ramdisk`: the paths are kept in memory (tmpfs), and files there count towards `user_max_gb`. A user who exceeds it is killed as for any other memory usage, and their files in the ramdisks are deleted. |
 | `paths` | `/tmp /var/tmp` | The directories to limit. |
-| `quota_gb` | `50` | With `quota`: max disk space per user on each filesystem that holds one of the paths. |
+| `quota_gb` | `50` | With `quota`: max disk space per user on each filesystem, for example 50GB on `/tmp` and 50GB on `/var` if they are separate filesystems. |
 | `ramdisk_gb` | `0` | With `ramdisk`: size of each ramdisk for all users together. `0` is half of the node's memory. |
 
-With `quota`, the `quota` package (`setquota`) must be installed and user quotas must be enabled on the filesystems. A user gets the quota the first time they access the node. Enabling user quotas, once per filesystem:
+With `quota`, the `quota` package (`setquota`) must be installed and user quotas must be enabled on the filesystems where `/tmp` and `/var/tmp` are located. `frontendshepherd` and `install.sh` do neither, they never touch `/etc/fstab` or mounts. Until quotas are enabled nothing is limited, and the daemon logs a warning saying what to do. A user gets the quota the first time they access the node. Enabling user quotas is done once per filesystem, here for `/tmp`:
 
-- ext4: add `usrquota` to the mount options in `/etc/fstab`, then `mount -o remount /tmp`, `quotacheck -cum /tmp` and `quotaon -u /tmp`.
+- ext4: add `usrquota` to the mount options in `/etc/fstab` and check it with `findmnt --verify`. Then apply it, create the quota file and switch quotas on: `mount -o remount /tmp && quotacheck -cum /tmp && quotaon -u /tmp`. A reboot alone does not create the quota file, but once it exists, quotas are switched on again at every boot.
 - XFS: add `uquota` to the mount options in `/etc/fstab`, then unmount and mount it again (a remount is not enough). For the root filesystem add `rootflags=uquota` to the kernel command line and reboot instead.
-- Check with `quotaon -pu /tmp`, and see everyone's usage with `repquota -s /tmp`. Users can see their own with `quota -s`.
+- Restart `frontendshepherd` afterwards: it stops trying a filesystem without quotas until it is restarted.
+- Check with `quotaon -pu /tmp`, also after the next reboot, and see everyone's usage with `repquota -s /tmp`. Users can see their own with `quota -s`.
 
 With `ramdisk`, the paths only become ramdisks at the next reboot, nothing is mounted on a running node. Everything in them is lost at every reboot, also in `/var/tmp`. If a path is already present in `/etc/fstab`, the ramdisk is mounted there instead and that filesystem is no longer used.
 
@@ -96,6 +97,7 @@ It starts in **dry-run mode**: it logs what it would do, but limits nothing and 
 1. Watch `journalctl -u frontendshepherd` for a few days.
 2. Edit `/etc/frontendshepherd.conf`, see [Configuration](#configuration). Set at least the mail `address` and `admin`, and `smtp_host` if you do not use the local sendmail. Check mail with `frontendshepherd testmail you@example.org`.
 3. Set `dry_run = false` and run `systemctl restart frontendshepherd`.
+4. Optional: to limit temporary files with disk quotas, enable user quotas on the filesystems first, see [Temporary files](#temporary-files), then set `mode = quota` under `[tmp]` and restart.
 
 ## Usage
 
