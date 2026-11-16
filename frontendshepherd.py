@@ -18,9 +18,9 @@ already gets (user.slice/user-UID.slice):
 A "CPU" here is a logical CPU as counted by nproc and top: one hardware
 thread. With hyper-threading, 2 CPUs are one physical core.
 
-3. Optional, off by default: a limit on what each user can store in /tmp
-   and /var/tmp, either with disk quotas or by making them ramdisks, where
-   files count towards the user's memory limit.
+3. Optional, off by default: a limit on the local disk space of each user,
+   by default in /tmp and /var/tmp, either with disk quotas or by making
+   them ramdisks, where files count towards the user's memory limit.
 
 Python 3.6+, standard library only. Needs cgroup v2 and systemd.
 """
@@ -87,7 +87,7 @@ The largest process was `{process}`.
 Login nodes are shared by everyone. To prevent impacting the responsiveness
 of the login nodes, please submit long and memory-heavy work as batch jobs,
 so that it runs on the dedicated compute nodes.""",
-    "ramdisk_note": "Files in {tmp_paths} are kept in memory and count towards your memory limit, so your files there have been deleted.",
+    "ramdisk_note": "Files in {ramdisk_paths} are kept in memory and count towards your memory limit, so your files there have been deleted.",
     "repeat_note": "This has happened {events} times within {days} days, so the cluster administrators have been copied on this message.",
 }
 
@@ -130,7 +130,7 @@ DEFAULTS = {
         "cluster_name": "",
         **MESSAGES,
     },
-    "tmp": {
+    "disk": {
         "mode": "off",
         "paths": "/tmp /var/tmp",
         "quota_gb": "50",
@@ -291,15 +291,23 @@ class Shepherd:
         self.sheepdog_last = 0.0
         self.sheepdog_seen = set()  # pids already recorded in dry run
 
-        t = cp["tmp"]
-        self.tmp_mode = t.get("mode").strip().lower()
-        if self.tmp_mode not in ("off", "quota", "ramdisk"):
-            log.warning("[tmp] mode must be off, quota or ramdisk, not %r: using off", self.tmp_mode)
-            self.tmp_mode = "off"
-        self.tmp_paths = [os.path.normpath(p) for p in t.get("paths").split()]
-        self.quota_gb = t.getfloat("quota_gb")
-        self.ramdisk_gb = t.getfloat("ramdisk_gb")
-        self.quota_mounts = None  # filesystems to set quotas on, found on first use
+        d = cp["disk"]
+        self.disk_mode = d.get("mode").strip().lower()
+        if self.disk_mode not in ("off", "quota", "ramdisk"):
+            log.warning("[disk] mode must be off, quota or ramdisk, not %r: using off", self.disk_mode)
+            self.disk_mode = "off"
+        self.quota_gb = d.getfloat("quota_gb")
+        # paths = /tmp:100 /var/tmp  ->  {"/tmp": 100, "/var/tmp": quota_gb}
+        self.path_quota = {}
+        for entry in d.get("paths").split():
+            path, _, gb = entry.partition(":")
+            try:
+                self.path_quota[os.path.normpath(path)] = float(gb) if gb else self.quota_gb
+            except ValueError:
+                log.warning("[disk] paths: %r is not PATH or PATH:GB, ignored", entry)
+        self.disk_paths = list(self.path_quota)
+        self.ramdisk_gb = d.getfloat("ramdisk_gb")
+        self.quota_mounts = None  # {filesystem: GB} to set quotas on, found on first use
         self.quota_done = set()   # users who have their quota
         self.disk_last = 0.0      # last check for full disks
 
@@ -448,41 +456,46 @@ class Shepherd:
 
     def apply_quota(self, uid):
         """mode = quota: give a user their disk quota on the filesystems of
-        the tmp paths, the first time the daemon sees them."""
+        the disk paths, the first time the daemon sees them."""
         if uid in self.quota_done:
             return
         self.quota_done.add(uid)
         if self.quota_mounts is None:
-            self.quota_mounts = set()
-            for path in self.tmp_paths:
-                if os.path.isdir(path):
-                    self.quota_mounts.add(mount_point(path))
-                else:
-                    log.warning("tmp path %s does not exist", path)
-        for mnt in sorted(self.quota_mounts):
+            self.quota_mounts = {}
+            for path, gb in self.path_quota.items():
+                if not os.path.isdir(path):
+                    log.warning("disk path %s does not exist", path)
+                    continue
+                mnt = mount_point(path)
+                if mnt in self.quota_mounts and self.quota_mounts[mnt] != gb:
+                    # a quota is per filesystem, so two paths on one filesystem share it
+                    gb = max(gb, self.quota_mounts[mnt])
+                    log.warning("the disk paths on %s have different quotas, using the "
+                                "largest: %.3g GB", mnt, gb)
+                self.quota_mounts[mnt] = gb
+        for mnt, gb in sorted(self.quota_mounts.items()):
             if self.dry_run:
-                log.info("QUOTA %s: would get %.3g GB on %s [dry run]",
-                         username(uid), self.quota_gb, mnt)
+                log.info("QUOTA %s: would get %.3g GB on %s [dry run]", username(uid), gb, mnt)
                 continue
             # no soft limit, hard limit in KiB, no limit on the number of files
             err = self.command(["setquota", "-u", str(uid), "0",
-                                str(int(self.quota_gb * 2**20)), "0", "0", mnt])
+                                str(int(gb * 2**20)), "0", "0", mnt])
             if err:
                 log.warning("cannot set disk quotas on %s, giving up on it until restart: %s "
                             "(user quotas must be on: add usrquota to its options in "
                             "/etc/fstab, then run `mount -o remount %s && quotacheck -cum %s "
                             "&& quotaon -u %s` and restart frontendshepherd)",
                             mnt, " ".join(err.split()), mnt, mnt, mnt)
-                self.quota_mounts.discard(mnt)
+                del self.quota_mounts[mnt]
             else:
-                log.info("QUOTA %s: %.3g GB on %s", username(uid), self.quota_gb, mnt)
+                log.info("QUOTA %s: %.3g GB on %s", username(uid), gb, mnt)
 
     def check_disks(self, now):
-        """Once a minute: record when a filesystem of the tmp paths runs
+        """Once a minute: record when a filesystem of the disk paths runs
         full, and with mode = quota when a user reaches their quota. Both are
         recorded once, when they happen, not for as long as they last."""
         full = self.state.setdefault("full_disks", [])
-        mounts = sorted({mount_point(p) for p in self.tmp_paths if os.path.isdir(p)})
+        mounts = sorted({mount_point(p) for p in self.disk_paths if os.path.isdir(p)})
         for mnt in mounts:
             try:
                 v = os.statvfs(mnt)
@@ -495,7 +508,7 @@ class Shepherd:
                 self.record(now, "disk_full", None, mnt)
             elif free > 0.05 and mnt in full:
                 full.remove(mnt)
-        if self.tmp_mode != "quota":
+        if self.disk_mode != "quota":
             return
         for uid, st in self.state["users"].items():
             at_limit = st.setdefault("disk_quota", [])
@@ -516,14 +529,14 @@ class Shepherd:
 
     def mount_units(self):
         """mode = ramdisk: return {unit name: content} of the systemd mount
-        units that put a ramdisk (tmpfs) on each tmp path."""
+        units that put a ramdisk (tmpfs) on each disk path."""
         out = {}
-        if self.tmp_mode != "ramdisk":
+        if self.disk_mode != "ramdisk":
             return out
         options = "mode=1777,strictatime,nosuid,nodev"
         if self.ramdisk_gb > 0:
             options += ",size=%dm" % (self.ramdisk_gb * 1024)
-        for path in self.tmp_paths:
+        for path in self.disk_paths:
             name = subprocess.run(["systemd-escape", "--path", "--suffix=mount", path],
                                   stdout=subprocess.PIPE, universal_newlines=True,
                                   check=True).stdout.strip()
@@ -573,7 +586,7 @@ class Shepherd:
             if err:
                 log.warning("cannot enable %s: %s", name, err)
         fstab = fstab_mount_points()
-        for path in self.tmp_paths if self.tmp_mode == "ramdisk" else ():
+        for path in self.disk_paths if self.disk_mode == "ramdisk" else ():
             if path in fstab:
                 log.warning("%s has its own filesystem in /etc/fstab: from the next boot "
                             "the ramdisk is mounted there instead, and that filesystem "
@@ -587,7 +600,7 @@ class Shepherd:
         is charged for them once the user's slice is gone. Delete them, as the
         user, so that nothing else can be touched."""
         cleaned = []
-        for path in self.tmp_paths:
+        for path in self.disk_paths:
             if not is_tmpfs(path):
                 continue
             cleaned.append(path)
@@ -693,7 +706,7 @@ class Shepherd:
             "events": len(st["events"]), "days": "%.3g" % (self.repeat_window / 86400),
             "processes": (top_processes(os.path.join(self.user_slice, "user-%s.slice" % uid))
                           if kind == "throttle" else ""),
-            "process": process, "tmp_paths": " and ".join(cleaned),
+            "process": process, "ramdisk_paths": " and ".join(cleaned),
         }
         body = self.render(kind + "_body", values) + "\n"
         if cleaned:
@@ -777,7 +790,7 @@ class Shepherd:
                 self.ensure_quota(uid, path,
                                   self.min_cpus if st["throttled"] else self.burst)
                 self.ensure_group_kill(path)
-                if self.tmp_mode == "quota":
+                if self.disk_mode == "quota":
                     self.apply_quota(uid)
             elif st["level"] >= self.capacity and not st["events"]:
                 del users[uid]  # logged out, nothing used, clean record: forget
@@ -864,7 +877,7 @@ class Shepherd:
             if uid and not self.exempt(int(uid)):
                 st = self.state["users"].setdefault(uid, self.new_user(now))
                 st["events"].append(now)
-                cleaned = self.clean_ramdisks(uid) if self.tmp_mode == "ramdisk" else []
+                cleaned = self.clean_ramdisks(uid) if self.disk_mode == "ramdisk" else []
                 self.notify_user(uid, "oom", st, now, process, cleaned)
 
     def sheepdog(self, now):
@@ -906,8 +919,9 @@ class Shepherd:
 
     def policy(self):
         tmp = {"off": "",
-               "quota": ", %.3g GB disk quota per user for %s" % (self.quota_gb, " ".join(self.tmp_paths)),
-               "ramdisk": ", %s in memory" % " ".join(self.tmp_paths)}[self.tmp_mode]
+               "quota": ", disk quota per user: " + ", ".join(
+                   "%.3g GB for %s" % (gb, p) for p, gb in self.path_quota.items()),
+               "ramdisk": ", %s in memory" % " ".join(self.disk_paths)}[self.disk_mode]
         return ("%.3g CPUs always free, burst up to %.3g CPUs, budget of %.3g "
                 "CPU-hours restored in %.3g hours, %.3g GB memory per user%s"
                 % (self.min_cpus, self.burst, self.capacity / 3600,
@@ -1128,7 +1142,7 @@ def status_all(s):
 
 EVENTS = [("throttle", "CPU throttled"), ("memory", "killed, user memory limit"),
           ("total_memory", "killed, total memory limit"), ("disk_quota", "reached the disk quota"),
-          ("disk_full", "temp filesystem full"), ("sheepdog", "stale process stopped"),
+          ("disk_full", "local disk full"), ("sheepdog", "stale process stopped"),
           ("reset", "reset by an admin")]
 
 

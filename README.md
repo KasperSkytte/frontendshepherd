@@ -6,7 +6,7 @@
 
 **CPU usage** is limited both with a max number of available CPUs per user, but also by using a "budget" of CPU hours per user (by default 8 CPU hours), so that some burst load is always possible, for example for compiling and installing software, building containers, doing quick data analyses etc. When the budget is used up, the user's processes are throttled to a bare minimum (by default 2 CPUs), which is still enough for longer `rsync` data transfers and for normal work like coding on the frontend node. The throttle is lifted when the whole budget is available again (by default after 4 hours), and it only recovers while the user's average CPU usage is below the bare minimum.
 
-**Temporary files** in `/tmp` and `/var/tmp` can optionally be limited per user too (off by default), either with disk quotas or by making them ramdisks, where files count as the user's memory.
+**Local disk space** can optionally be limited per user too (off by default), by default in `/tmp` and `/var/tmp`, either with disk quotas or by making them ramdisks, where files count as the user's memory.
 
 **Stale processes** are rounded up by the "sheepdog": processes matching a pattern (like `vscode-server` processes!) are automatically killed after running for a max walltime (by default 7 days) to prevent unnecessary processes from accumulating over time.
 
@@ -14,7 +14,7 @@
 
 `frontendshepherd` is designed to be as simple as possible ([KISS](https://en.wikipedia.org/wiki/KISS_principle)): one Python file, one config file, one systemd unit. Furthermore, it works completely independently from any specific workload scheduling system (like SLURM or PBS, etc) and is thus compatible with any computing cluster, or even useful in other scenarios where nodes are shared among many users.
 
-![How frontendshepherd limits CPU usage, memory usage and temporary files per user](docs/flowchart.svg)
+![How frontendshepherd limits CPU usage, memory usage and local disk space per user](docs/flowchart.svg)
 
 ## Configuration
 
@@ -38,17 +38,19 @@ Note: A CPU is one hardware thread, as counted by `nproc` and `top`. For example
 | `user_max_gb` | `16` | Memory per user. Hard limit. Exceeding this limit kills all of that user's processes on the node, and other users are not affected. No page swap is ever allowed to prevent local storage filling up. |
 | `reserved_gb` | `8` | Memory always unavailable to users to avoid exhausting the node. |
 
-### Temporary files
-Off by default. The settings are in the `[tmp]` section of the config file.
+### Local disk space
+Off by default. The settings are in the `[disk]` section of the config file. By default only `/tmp` and `/var/tmp` are limited, but with `quota` any local directory users can write to can be added, for example a local `/scratch`.
 
 | Setting | Default | |
 |---|---|---|
 | `mode` | `off` | `quota`: a disk quota per user. A user at the limit gets "Disk quota exceeded", nothing is killed. `ramdisk`: the paths are kept in memory (tmpfs), and files there count towards `user_max_gb`. A user who exceeds it is killed as for any other memory usage, and their files in the ramdisks are deleted. |
-| `paths` | `/tmp /var/tmp` | The directories to limit. |
-| `quota_gb` | `50` | With `quota`: max disk space per user on each filesystem, for example 50GB on `/tmp` and 50GB on `/var` if they are separate filesystems. |
+| `paths` | `/tmp /var/tmp` | The directories to limit. With `quota` each can have its own quota in GB, for example `/tmp:100 /var/tmp:20`. |
+| `quota_gb` | `50` | With `quota`: max disk space per user for the paths without their own quota. |
 | `ramdisk_gb` | `0` | With `ramdisk`: size of each ramdisk for all users together. `0` is half of the node's memory. |
 
-With `quota`, the `quota` package (`setquota`) must be installed and user quotas must be enabled on the filesystems where `/tmp` and `/var/tmp` are located. `frontendshepherd` and `install.sh` do neither, they never touch `/etc/fstab` or mounts. Until quotas are enabled nothing is limited, and the daemon logs a warning saying what to do. A user gets the quota the first time they access the node. Enabling user quotas is done once per filesystem, here for `/tmp`:
+A quota applies to a whole filesystem, not only to the directory, so it also covers everything else the user has on it. For example with `/var/tmp` on the `/var` filesystem, also the user's mail in `/var/mail`. If two paths are on the same filesystem, they share one quota, the largest of the two.
+
+With `quota`, the `quota` package (`setquota`) must be installed and user quotas must be enabled on the filesystems where the paths are located. `frontendshepherd` and `install.sh` do neither, they never touch `/etc/fstab` or mounts. Until quotas are enabled nothing is limited, and the daemon logs a warning saying what to do. A user gets the quota the first time they access the node. Enabling user quotas is done once per filesystem, here for `/tmp`:
 
 - ext4: add `usrquota` to the mount options in `/etc/fstab` and check it with `findmnt --verify`. Then apply it, create the quota file and switch quotas on: `mount -o remount /tmp && quotacheck -cum /tmp && quotaon -u /tmp`. A reboot alone does not create the quota file, but once it exists, quotas are switched on again at every boot.
 - XFS: add `uquota` to the mount options in `/etc/fstab`, then unmount and mount it again (a remount is not enough). For the root filesystem add `rootflags=uquota` to the kernel command line and reboot instead.
@@ -82,7 +84,7 @@ Say a user accidentally starts a large `minimap2` mapping with 32 threads for se
 ## Requirements
 
 - Linux with cgroup v2 (the default on all current distributions)
-- Only for disk quotas on `/tmp` (off by default): the `quota` package and user quotas enabled on the filesystem
+- Only for disk quotas (off by default): the `quota` package and user quotas enabled on the filesystems
 - systemd
 - Python 3.6 or later, no extra packages
 
@@ -97,7 +99,7 @@ It starts in **dry-run mode**: it logs what it would do, but limits nothing and 
 1. Watch `journalctl -u frontendshepherd` for a few days.
 2. Edit `/etc/frontendshepherd.conf`, see [Configuration](#configuration). Set at least the mail `address` and `admin`, and `smtp_host` if you do not use the local sendmail. Check mail with `frontendshepherd testmail you@example.org`.
 3. Set `dry_run = false` and run `systemctl restart frontendshepherd`.
-4. Optional: to limit temporary files with disk quotas, enable user quotas on the filesystems first, see [Temporary files](#temporary-files), then set `mode = quota` under `[tmp]` and restart.
+4. Optional: to limit local disk space with disk quotas, enable user quotas on the filesystems first, see [Local disk space](#local-disk-space), then set `mode = quota` under `[disk]` and restart.
 
 ## Usage
 
@@ -117,7 +119,7 @@ Admins can give a user their whole budget back and lift the throttle right away 
 
 Everything the daemon does is logged to the systemd journal: every throttle, release, reset, process killed for memory and stale process terminated, with user and time. View it with `journalctl -u frontendshepherd`.
 
-For an overview over time, `frontendshepherd stats` (root only) shows how many times users were throttled, killed for memory, reached their disk quota and had stale processes stopped, and how often a filesystem of `/tmp` or `/var/tmp` ran full (less than 1% left), in total, per week and for the users with the most events. By default for the last 90 days, use `--days` to change it. Full filesystems are recorded in every `[tmp]` mode, also `off`, and disk quotas only with `quota`. The events are kept for a year (`history_days`) in `/var/lib/frontendshepherd/history.jsonl`, one JSON line per event, and each node keeps its own:
+For an overview over time, `frontendshepherd stats` (root only) shows how many times users were throttled, killed for memory, reached their disk quota and had stale processes stopped, and how often the filesystem of one of the disk paths ran full (less than 1% left), in total, per week and for the users with the most events. By default for the last 90 days, use `--days` to change it. Full filesystems are recorded in every `[disk]` mode, also `off`, and disk quotas only with `quota`. The events are kept for a year (`history_days`) in `/var/lib/frontendshepherd/history.jsonl`, one JSON line per event, and each node keeps its own:
 
     $ sudo frontendshepherd stats --days 30
     Events on bio-fe01 in the last 30 days (since 2026-10-14)
@@ -127,7 +129,7 @@ For an overview over time, `frontendshepherd stats` (root only) shows how many t
     killed, user memory limit         2      2
     killed, total memory limit        0      0
     reached the disk quota            3      2
-    temp filesystem full              0      -
+    local disk full                   0      -
     stale process stopped             9      3
     reset by an admin                 1      1
 
@@ -156,7 +158,7 @@ There is no limit on the number of users logged in at once. Nothing is reserved 
 - Cron jobs are covered only if cron's PAM stack uses `pam_systemd` (the usual default). Check that they show up under the user's slice in `systemd-cgls`.
 - Stopping the daemon lifts all throttles; the memory limits and CPU ceiling stay. CPU budgets survive restarts and reboots.
 - Disk quotas that were set stay when `mode` is changed or the tool is uninstalled. Remove one with `setquota -u USER 0 0 0 0 /tmp`.
-- Uninstall: set `mode = off` under `[tmp]` and restart if ramdisks were used, disable the service, then `rm /etc/systemd/system/user*.slice.d/90-frontendshepherd.conf` and `systemctl daemon-reload`.
+- Uninstall: set `mode = off` under `[disk]` and restart if ramdisks were used, disable the service, then `rm /etc/systemd/system/user*.slice.d/90-frontendshepherd.conf` and `systemctl daemon-reload`.
 
 ## Testing whether it works as intended
 
@@ -165,44 +167,39 @@ Unit tests, no root needed:
     python3 tests/test_shepherd.py
 
 ### On a live node
-Log in over SSH as a regular user that is not exempt (`sudo` and `su` sessions do not count as a login of that user). Only test this with `dry_run = false`. In dry run nothing is limited, so the memory test would just use up the node's memory. First check that the limits are in place:
+Log in over SSH as a regular, non-exempt user (`sudo` and `su` sessions do not count), with `dry_run = false`. Check that the limits are in place:
 
 ```
 cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/memory.max   # user_max_gb in bytes, not "max"
-cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/cpu.max      # max_cpus x 100000, e.g. "800000 100000"
+cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/cpu.max      # max_cpus x 100000
 ```
 
-**CPU.** With the defaults it takes 1 hour at 8 CPUs to use up the budget. To test faster, set `budget_cpu_hours = 0.1` and `refill_hours = 0.1` and restart the service, then the user is throttled after about 45 seconds and released 6 minutes after the load has stopped. Remember to set them back afterwards.
+**CPU.** Set `budget_cpu_hours = 0.1` and `refill_hours = 0.1` and restart to be throttled within a minute (set them back afterwards):
 
 ```
-# start more busy processes than max_cpus, they stop by themselves after 2 hours
 for i in $(seq 16); do timeout 2h sh -c 'while :; do :; done' & done
-
-top -u $USER                 # together they never use more than max_cpus x 100 %
-frontendshepherd status      # the CPU budget being used, then THROTTLED
-
-# when throttled, the ceiling is min_cpus, e.g. "200000 100000", and a mail is sent
-cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/cpu.max
-
-# stop the load and watch the budget recover until the throttle is lifted
-pkill -u $USER timeout
+frontendshepherd status      # budget used, then THROTTLED, and a mail is sent
+pkill -u $USER timeout       # stop, the throttle is lifted when the budget is restored
 ```
 
-As root, `frontendshepherd reset USER` gives the user their whole budget back right away.
-
-**Memory.** This kills all of the user's processes on the node and logs the user out, so run it in an extra SSH session and not in one you need:
+**Memory.** Kills all of the user's processes and logs them out, so use an extra SSH session:
 
 ```
-# uses 1 GB more every second until the kernel kills it at user_max_gb
 python3 -c '
 import time
 a = []
 while True:
-    a.append(b"x" * 2**30)
-    print(len(a), "GB", flush=True)
-    time.sleep(1)'
+    a.append(b"x" * 2**30); print(len(a), "GB", flush=True); time.sleep(1)'
 ```
 
-The user's other sessions are closed too and a mail is sent. Logging in again works right away. As root, see what happened with `journalctl -u frontendshepherd` and `journalctl -k | grep oom-kill`.
+To test the total limit instead, set `reserved_gb` so that less than `user_max_gb` is left for all users (e.g. `244` on a 256GB node) and restart. Only when the node is not in use.
 
-The limit for all users together is harder to reach, as it needs several users at once. To test it, temporarily set `reserved_gb` so that all users together get less than `user_max_gb` (e.g. `reserved_gb = 244` on a 256GB node leaves 12GB for all users) and restart. The memory test above then hits the total limit first, and the admin gets a mail too. Every logged-in user shares that limit while it is set, so do this when the node is not in use.
+**Disk quota.** With `mode = quota`:
+
+```
+quota -s                                                    # your quota on /tmp and /var
+dd if=/dev/zero of=/tmp/$USER.fill bs=1M status=progress    # stops with "Disk quota exceeded"
+rm /tmp/$USER.fill
+```
+
+Afterwards, as root: `journalctl -u frontendshepherd`, `journalctl -k | grep oom-kill` and `frontendshepherd stats --days 1`. `frontendshepherd reset USER` lifts a throttle right away.

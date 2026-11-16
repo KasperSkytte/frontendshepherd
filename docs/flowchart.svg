@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 1020" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" text-anchor="middle">
-  <title>How frontendshepherd limits CPU usage, memory usage and temporary files per user</title>
+  <title>How frontendshepherd limits CPU usage, memory usage and local disk space per user</title>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
       <path d="M0 0L10 5L0 10z" fill="#475569"/>
@@ -111,7 +111,7 @@
   <text x="740" y="648">The admin is notified by email.</text>
 
   <!-- temporary files -->
-  <text class="lane" x="590" y="704">TEMPORARY FILES IN /tmp AND /var/tmp</text>
+  <text class="lane" x="590" y="704">LOCAL DISK SPACE, /tmp AND /var/tmp BY DEFAULT</text>
   <text class="lane" x="590" y="720">OPTIONAL, OFF BY DEFAULT</text>
   <rect class="box" x="590" y="730" width="430" height="126" rx="8"/>
   <text class="b" x="805" y="756">Limited per user, depending on <tspan class="m">mode</tspan></text>

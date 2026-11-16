@@ -247,7 +247,7 @@ class TestSliceOnly(unittest.TestCase):
 class TestTmp(unittest.TestCase):
     def fake(self, mode):
         f = Fake()
-        f.cp["tmp"].update(mode=mode, paths="/tmp /var/tmp", quota_gb="50", ramdisk_gb="32")
+        f.cp["disk"].update(mode=mode, paths="/tmp /var/tmp", quota_gb="50", ramdisk_gb="32")
         f.s = fs.Shepherd(f.cp)
         f.s.send = lambda to, subject, body, cc=None: f.mails.append((to, subject, body))
         f.commands = []
@@ -256,22 +256,52 @@ class TestTmp(unittest.TestCase):
 
     def test_off_by_default(self):
         f = Fake()
-        self.assertEqual(f.s.tmp_mode, "off")
+        self.assertEqual(f.s.disk_mode, "off")
         self.assertEqual(f.s.mount_units(), {})
 
     def test_quota_is_set_once_per_user_and_filesystem(self):
         f = self.fake("quota")
-        f.s.quota_mounts = {"/tmp"}
+        f.s.quota_mounts = {"/tmp": 50}
         f.s.apply_quota(UID)
         f.s.apply_quota(UID)
         self.assertEqual(f.commands, [["setquota", "-u", UID, "0", str(50 * 2**20), "0", "0", "/tmp"]])
 
     def test_quota_gives_up_on_a_filesystem_without_quotas(self):
         f = self.fake("quota")
-        f.s.quota_mounts = {"/tmp"}
+        f.s.quota_mounts = {"/tmp": 50}
         f.s.command = lambda cmd, **kw: "quotas not enabled"
         f.s.apply_quota(UID)
-        self.assertEqual(f.s.quota_mounts, set())
+        self.assertEqual(f.s.quota_mounts, {})
+
+    def test_each_path_can_have_its_own_quota(self):
+        f = Fake()
+        root = f.tmp.name
+        os.makedirs(os.path.join(root, "a"))
+        os.makedirs(os.path.join(root, "b"))
+        f.cp["disk"].update(mode="quota", quota_gb="50",
+                            paths="%s/a:100 %s/b" % (root, root))
+        f.s = fs.Shepherd(f.cp)
+        self.assertEqual(f.s.path_quota, {root + "/a": 100, root + "/b": 50})
+        mounts = {root + "/a": "/mnt/a", root + "/b": "/mnt/b"}
+        real, fs.mount_point = fs.mount_point, lambda p: mounts[p]
+        cmds = []
+        f.s.command = lambda cmd, **kw: cmds.append(cmd)
+        try:
+            f.s.apply_quota(UID)
+        finally:
+            fs.mount_point = real
+        self.assertEqual(cmds, [["setquota", "-u", UID, "0", str(100 * 2**20), "0", "0", "/mnt/a"],
+                                ["setquota", "-u", UID, "0", str(50 * 2**20), "0", "0", "/mnt/b"]])
+
+    def test_paths_on_one_filesystem_share_the_largest_quota(self):
+        f = Fake()
+        root = f.tmp.name
+        f.cp["disk"].update(mode="quota", paths="%s:20 %s:30" % (root, f.slice))
+        f.s = fs.Shepherd(f.cp)
+        cmds = []
+        f.s.command = lambda cmd, **kw: cmds.append(cmd)
+        f.s.apply_quota(UID)
+        self.assertEqual([c[4] for c in cmds], [str(30 * 2**20)])
 
     def test_ramdisk_mount_units(self):
         units = self.fake("ramdisk").s.mount_units()
@@ -353,7 +383,7 @@ class TestHistory(unittest.TestCase):
 
     def test_full_disk_and_quota_are_recorded_once(self):
         f = Fake()
-        f.s.tmp_mode, f.s.tmp_paths = "quota", [f.tmp.name]
+        f.s.disk_mode, f.s.disk_paths = "quota", [f.tmp.name]
         f.s.state["users"][UID] = f.s.new_user(f.now)
         free, used = [50], [10 * 2**30]
         stat = lambda mnt: os.statvfs_result((4096, 4096, 1000, free[0], free[0], 0, 0, 0, 0, 255))
