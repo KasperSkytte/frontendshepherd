@@ -350,6 +350,37 @@ class TestTmp(unittest.TestCase):
         self.assertIn("Files in /tmp are kept in memory", f.mails[-1][2])
 
 
+class TestReserved(unittest.TestCase):
+    def run_with(self, reserved, fstype="ext4", current=0):
+        f = Fake()
+        f.cp["disk"].update(paths=f.tmp.name, reserved_gb=reserved)
+        f.s = fs.Shepherd(f.cp)
+        cmds = []
+        f.s.command = lambda cmd, **kw: cmds.append(cmd)
+        listing = "Block count: 10000000\nReserved block count: %d\nBlock size: 4096\n" % current
+        real = fs.mount_point, fs.mount_source, fs.mount_type, fs.subprocess.run
+        fs.mount_point = lambda p: "/mnt"
+        fs.mount_source = lambda p: "/dev/x"
+        fs.mount_type = lambda p: fstype
+        fs.subprocess.run = lambda *a, **kw: type("R", (), {"stdout": listing})()
+        try:
+            f.s.set_reserved()
+        finally:
+            fs.mount_point, fs.mount_source, fs.mount_type, fs.subprocess.run = real
+        return cmds
+
+    def test_reserved_blocks_are_set(self):
+        self.assertEqual(self.run_with("2"), [["tune2fs", "-r", str(2 * 2**30 // 4096), "/dev/x"]])
+
+    def test_nothing_changes_when_already_right_or_off(self):
+        self.assertEqual(self.run_with("2", current=2 * 2**30 // 4096), [])
+        self.assertEqual(self.run_with(""), [])
+
+    def test_only_ext4_and_never_more_than_half(self):
+        self.assertEqual(self.run_with("2", fstype="xfs"), [])
+        self.assertEqual(self.run_with("3000"), [])  # the filesystem is 38 GB
+
+
 class TestHistory(unittest.TestCase):
     def test_throttle_and_kill_are_recorded(self):
         f = Fake()

@@ -47,6 +47,7 @@ Off by default. The settings are in the `[disk]` section of the config file. By 
 | `paths` | `/tmp /var/tmp` | The directories to limit. With `quota` each can have its own quota in GB, for example `/tmp:100 /var/tmp:20`. |
 | `quota_gb` | `50` | With `quota`: max disk space per user for the paths without their own quota. |
 | `ramdisk_gb` | `0` | With `ramdisk`: size of each ramdisk for all users together. `0` is half of the node's memory. |
+| `reserved_gb` | empty | Disk space only root can use, so users together can never fill a disk completely. One number for all, or per path like `/tmp:20 /var/tmp:5`. Works in every `mode`, only on ext4. Empty leaves the disks as they are. |
 
 A quota applies to a whole filesystem, not only to the directory, so it also covers everything else the user has on it. For example with `/var/tmp` on the `/var` filesystem, also the user's mail in `/var/mail`. If two paths are on the same filesystem, they share one quota, the largest of the two.
 
@@ -107,11 +108,13 @@ Any user can check their own allowance:
 
     $ frontendshepherd status
     alice on login1
-      State       ok; at this rate your CPU budget is used up in about 56 min
-      CPU in use  5.0 CPUs (up to 8 allowed, 2 are free of charge)
-      CPU budget  41% used (3.3 of 8 CPU-hours)
-      Memory      3.1 of 16 GB
-      Warnings    0 in the last 7 days
+      State          ok; at this rate your CPU budget is used up in about 56 min
+      CPU in use     5.0 CPUs (up to 8 allowed, 2 are free of charge)
+      CPU budget     41% used (3.3 of 8 CPU-hours)
+      Memory         3.1 of 16 GB
+      Disk /tmp      12.4 of 50 GB used, 480 GB free on the disk
+      Disk /var/tmp  0.1 of 10 GB used, 31 GB free on the disk
+      Warnings       0 in the last 7 days
 
 Users can only see their own status. As root, `frontendshepherd status` lists everyone and `frontendshepherd status alice` shows one user.
 

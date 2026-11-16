@@ -135,6 +135,7 @@ DEFAULTS = {
         "paths": "/tmp /var/tmp",
         "quota_gb": "50",
         "ramdisk_gb": "0",
+        "reserved_gb": "",
     },
     "sheepdog": {
         "enabled": "true",
@@ -307,6 +308,15 @@ class Shepherd:
                 log.warning("[disk] paths: %r is not PATH or PATH:GB, ignored", entry)
         self.disk_paths = list(self.path_quota)
         self.ramdisk_gb = d.getfloat("ramdisk_gb")
+        # reserved_gb = 20, or per path: /tmp:20 /var/tmp:5. Empty: leave as it is
+        self.path_reserved = {}
+        for entry in d.get("reserved_gb").split():
+            path, _, gb = entry.rpartition(":")
+            try:
+                for p in ([os.path.normpath(path)] if path else self.disk_paths):
+                    self.path_reserved[p] = float(gb)
+            except ValueError:
+                log.warning("[disk] reserved_gb: %r is not GB or PATH:GB, ignored", entry)
         self.quota_mounts = None  # {filesystem: GB} to set quotas on, found on first use
         self.quota_done = set()   # users who have their quota
         self.disk_last = 0.0      # last check for full disks
@@ -489,6 +499,45 @@ class Shepherd:
                 del self.quota_mounts[mnt]
             else:
                 log.info("QUOTA %s: %.3g GB on %s", username(uid), gb, mnt)
+
+    def set_reserved(self):
+        """Keep `reserved_gb` of each ext4 filesystem of the disk paths for
+        root only, with the filesystem's own reserved blocks (tune2fs -r).
+        Users together can then never fill it completely."""
+        done = set()
+        for path, gb in self.path_reserved.items():
+            if not os.path.isdir(path):
+                continue
+            mnt = mount_point(path)
+            if mnt in done:
+                continue
+            done.add(mnt)
+            dev, fstype = mount_source(mnt), mount_type(mnt)
+            if fstype not in ("ext2", "ext3", "ext4"):
+                log.warning("cannot reserve disk space on %s: only for ext4, not %s", mnt, fstype)
+                continue
+            info = {}
+            try:
+                out = subprocess.run(["tune2fs", "-l", dev], stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, universal_newlines=True,
+                                     timeout=60).stdout
+                for line in out.splitlines():
+                    k, _, v = line.partition(":")
+                    info[k.strip()] = v.strip()
+                size, count = int(info["Block size"]), int(info["Block count"])
+                current = int(info["Reserved block count"])
+            except (OSError, subprocess.SubprocessError, KeyError, ValueError) as e:
+                log.warning("cannot read the reserved space of %s: %s", mnt, e)
+                continue
+            want = int(gb * 2**30 / size)
+            if want > count // 2:
+                log.warning("not reserving %.3g GB on %s: more than half of it", gb, mnt)
+            elif abs(want - current) * size >= 2**30 / 10:  # leave it if within 0.1 GB
+                err = self.command(["tune2fs", "-r", str(want), dev])
+                if err:
+                    log.warning("cannot reserve disk space on %s: %s", mnt, err)
+                else:
+                    log.info("RESERVED %.3g GB on %s for root, users can not use it", gb, mnt)
 
     def check_disks(self, now):
         """Once a minute: record when a filesystem of the disk paths runs
@@ -936,6 +985,7 @@ class Shepherd:
         else:
             self.write_dropins()
             self.write_mount_units()
+            self.set_reserved()
         self.open_kmsg()
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: self.stop.set())
@@ -1004,6 +1054,41 @@ def get_quota(mnt, uid):
     if libc.quotactl((Q_GETQUOTA << 8) | USRQUOTA, source.encode(), uid, ctypes.byref(q)) != 0:
         return None
     return q.curspace, q.bhardlimit * 1024  # limits are in blocks of 1 KiB
+
+
+def mount_type(path, mounts="/proc/self/mounts"):
+    """The filesystem type mounted on `path`."""
+    fstype = None
+    for line in (read_file(mounts) or "").splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[1].replace("\\040", " ") == path:
+            fstype = fields[2]
+    return fstype
+
+
+def disk_usage(s, uid=None):
+    """[(path, GB used by the user or None, GB quota or None, GB free for
+    users)] for each filesystem of the disk paths."""
+    out, seen = [], set()
+    for path in s.disk_paths:
+        if not os.path.isdir(path):
+            continue
+        mnt = mount_point(path)
+        if mnt in seen:
+            continue
+        seen.add(mnt)
+        used = limit = None
+        if uid is not None and s.disk_mode == "quota":
+            q = get_quota(mnt, int(uid))
+            if q:
+                used, limit = q[0] / 2**30, (q[1] / 2**30 or None)
+        try:
+            v = os.statvfs(mnt)
+            free = v.f_bavail * v.f_frsize / 2**30
+        except OSError:
+            free = None
+        out.append((path, used, limit, free))
+    return out
 
 
 def fstab_mount_points(fstab="/etc/fstab"):
@@ -1118,22 +1203,37 @@ def status(s, user=None, show_all=False):
         ("CPU budget", "%d%% used (%.1f of %.3g CPU-hours)"
          % (100 * (s.capacity - level) / s.capacity, (s.capacity - level) / 3600, hours)),
         ("Memory", "%.1f of %.3g GB" % (mem or 0, s.user_max_gb)),
-        ("Warnings", "%d in the last %.3g days" % (len(st["events"]), s.repeat_window / 86400)),
     ]
+    for path, used, limit, free in disk_usage(s, uid):
+        text = [] if used is None else ["%.1f of %s GB used" % (used, "%.3g" % limit if limit else "unlimited")]
+        if free is not None:
+            text.append("%.0f GB free on the disk" % free)
+        rows.append(("Disk " + path, ", ".join(text) or "-"))
+    rows.append(("Warnings", "%d in the last %.3g days" % (len(st["events"]), s.repeat_window / 86400)))
+    width = max(len(k) for k, _ in rows)
     for k, v in rows:
-        print("  %-11s %s" % (k, v))
+        print("  %-*s  %s" % (width, k, v))
 
 
 def status_all(s):
     users = s.state["users"]
-    print("Policy on %s: %s%s\n" % (s.host, s.policy(), "  [DRY RUN]" if s.dry_run else ""))
-    fmt = "%-16s %7s %12s %9s %10s  %s"
-    print(fmt % ("USER", "CPUS", "BUDGET USED", "MEM (GB)", "WARNINGS", "STATE"))
+    print("Policy on %s: %s%s" % (s.host, s.policy(), "  [DRY RUN]" if s.dry_run else ""))
+    free = ["%s %.0f GB" % (p, f) for p, _, _, f in disk_usage(s) if f is not None]
+    if free:
+        print("Free disk space for users: " + ", ".join(free))
+    quota = s.disk_mode == "quota"
+    fmt = "%-16s %7s %12s %9s" + (" %10s" if quota else "%s") + " %10s  %s"
+    print("\n" + fmt % ("USER", "CPUS", "BUDGET USED", "MEM (GB)", "DISK (GB)" if quota else "",
+                        "WARNINGS", "STATE"))
     for uid, st in sorted(users.items(), key=lambda kv: kv[1]["level"]):
         mem = memory_gb(s, uid)
+        disk = ""
+        if quota:
+            used = [u for _, u, _, _ in disk_usage(s, uid) if u is not None]
+            disk = "%.1f" % sum(used) if used else "-"
         print(fmt % (username(uid)[:16], "%.1f" % st["cores"],
                      "%d%%" % max(0, 100 - 100 * st["level"] / s.capacity),
-                     "-" if mem is None else "%.1f" % mem,
+                     "-" if mem is None else "%.1f" % mem, disk,
                      len(st["events"]),
                      "THROTTLED" if st["throttled"] else "ok"))
     if not users:
