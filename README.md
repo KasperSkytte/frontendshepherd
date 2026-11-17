@@ -6,7 +6,7 @@
 
 **CPU usage** is limited both with a max number of available CPUs per user, but also by using a "budget" of CPU hours per user (by default 8 CPU hours), so that some burst load is always possible, for example for compiling and installing software, building containers, doing quick data analyses etc. When the budget is used up, the user's processes are throttled to a bare minimum (by default 2 CPUs), which is still enough for longer `rsync` data transfers and for normal work like coding on the frontend node. The throttle is lifted when the whole budget is available again (by default after 4 hours), and it only recovers while the user's average CPU usage is below the bare minimum.
 
-**Local disk space** can optionally be limited per user too (off by default), by default in `/tmp` and `/var/tmp`, either with disk quotas or by making them ramdisks, where files count as the user's memory.
+**Local disk space** can optionally be limited per user too (off by default), by default in `/tmp` and `/var/tmp`, either with disk quotas or by making them ramdisks, where files count as memory usage.
 
 **Stale processes** are rounded up by the "sheepdog": processes matching a pattern (like `vscode-server` processes!) are automatically killed after running for a max walltime (by default 7 days) to prevent unnecessary processes from accumulating over time.
 
